@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestROS1MSGParser(t *testing.T) {
@@ -42,6 +43,33 @@ func TestROS1MSGParser(t *testing.T) {
 					Name: "bar",
 					Type: Type{
 						BaseType: "int32",
+					},
+				},
+			},
+		},
+		{
+			"two primitive fields with type and name separated by tab and space",
+			"",
+			`string	 foo
+			 int32 	bar
+			 float32	 	baz`,
+			[]Field{
+				{
+					Name: "foo",
+					Type: Type{
+						BaseType: "string",
+					},
+				},
+				{
+					Name: "bar",
+					Type: Type{
+						BaseType: "int32",
+					},
+				},
+				{
+					Name: "baz",
+					Type: Type{
+						BaseType: "float32",
 					},
 				},
 			},
@@ -249,6 +277,72 @@ func TestROS1MSGParser(t *testing.T) {
 			},
 		},
 		{
+			"relative type different from parent type",
+			"my_package",
+			`my_package/MyType foo
+			===
+			MSG: my_package/MyType
+			my_other_package/MyOtherType foo
+			TypeInParentPackage bar
+			===
+			MSG: my_package/TypeInParentPackage
+			my_other_package/MyOtherType foo
+			===
+			MSG: my_other_package/MyOtherType
+			string data
+			`,
+			[]Field{
+				{
+					Name: "foo",
+					Type: Type{
+						BaseType: "my_package/MyType",
+						IsRecord: true,
+						Fields: []Field{
+							{
+								Name: "foo",
+								Type: Type{
+									BaseType: "my_other_package/MyOtherType",
+									IsRecord: true,
+									Fields: []Field{
+										{
+											Name: "data",
+											Type: Type{
+												BaseType: "string",
+											},
+										},
+									},
+								},
+							},
+							{
+								Name: "bar",
+								Type: Type{
+									BaseType: "TypeInParentPackage",
+									IsRecord: true,
+									Fields: []Field{
+										{
+											Name: "foo",
+											Type: Type{
+												BaseType: "my_other_package/MyOtherType",
+												IsRecord: true,
+												Fields: []Field{
+													{
+														Name: "data",
+														Type: Type{
+															BaseType: "string",
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			"uses tabs instead of spaces",
 			"",
 			"string foo\t# no spaces for me",
@@ -278,7 +372,7 @@ func TestROS1MSGParser(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.assertion, func(t *testing.T) {
 			fields, err := ParseMessageDefinition(c.parentPackage, []byte(c.messageDefinition))
-			assert.Nil(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, c.fields, fields)
 		})
 	}

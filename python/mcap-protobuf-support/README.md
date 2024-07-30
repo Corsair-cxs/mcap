@@ -30,9 +30,9 @@ cd examples
 You should now be able to run the examples:
 
 ```bash
-pipenv run python point_cloud_example.py
+pipenv run python point_cloud_example.py output.mcap
 ```
 
 ## Stay in touch
 
-Join our [Slack channel](https://foxglove.dev/join-slack) to ask questions, share feedback, and stay up to date on what our team is working on.
+Join our [Slack channel](https://foxglove.dev/slack) to ask questions, share feedback, and stay up to date on what our team is working on.

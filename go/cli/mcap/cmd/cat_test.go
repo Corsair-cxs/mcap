@@ -2,17 +2,16 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"io"
-	"io/ioutil"
+	"os"
 	"testing"
 
 	"github.com/foxglove/mcap/go/mcap"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCat(t *testing.T) {
-	ctx := context.Background()
 	cases := []struct {
 		assertion string
 		inputfile string
@@ -23,19 +22,25 @@ func TestCat(t *testing.T) {
 			"../../../../tests/conformance/data/OneMessage/OneMessage-ch-chx-mx-pad-rch-rsh-st-sum.mcap",
 			"2 example [Example] [1 2 3]\n",
 		},
+		{
+			"OneSchemalessMessage",
+			"../../../../tests/conformance/data/OneSchemalessMessage/OneSchemalessMessage-ch-chx-mx-pad-rch-st.mcap",
+			"2 example [no schema] [1 2 3]\n",
+		},
 	}
 	for _, c := range cases {
-		input, err := ioutil.ReadFile(c.inputfile)
-		assert.Nil(t, err)
+		input, err := os.ReadFile(c.inputfile)
+		require.NoError(t, err)
 		w := new(bytes.Buffer)
 		r := bytes.NewReader(input)
 		t.Run(c.assertion, func(t *testing.T) {
 			reader, err := mcap.NewReader(r)
-			assert.Nil(t, err)
+			require.NoError(t, err)
+			defer reader.Close()
 			it, err := reader.Messages()
-			assert.Nil(t, err)
-			err = printMessages(ctx, w, it, false)
-			assert.Nil(t, err)
+			require.NoError(t, err)
+			err = printMessages(w, it, false)
+			require.NoError(t, err)
 			r.Reset(input)
 			assert.Equal(t, c.expected, w.String())
 		})
@@ -43,7 +48,6 @@ func TestCat(t *testing.T) {
 }
 
 func BenchmarkCat(b *testing.B) {
-	ctx := context.Background()
 	cases := []struct {
 		assertion  string
 		inputfile  string
@@ -56,19 +60,22 @@ func BenchmarkCat(b *testing.B) {
 		},
 	}
 	for _, c := range cases {
-		input, err := ioutil.ReadFile(c.inputfile)
-		assert.Nil(b, err)
+		input, err := os.ReadFile(c.inputfile)
+		require.NoError(b, err)
 		w := io.Discard
 		r := bytes.NewReader(input)
 		b.Run(c.assertion, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				reader, err := mcap.NewReader(r)
-				assert.Nil(b, err)
-				it, err := reader.Messages()
-				assert.Nil(b, err)
-				err = printMessages(ctx, w, it, c.formatJSON)
-				assert.Nil(b, err)
-				r.Reset(input)
+				func() {
+					reader, err := mcap.NewReader(r)
+					require.NoError(b, err)
+					defer reader.Close()
+					it, err := reader.Messages()
+					require.NoError(b, err)
+					err = printMessages(w, it, c.formatJSON)
+					require.NoError(b, err)
+					r.Reset(input)
+				}()
 			}
 		})
 	}

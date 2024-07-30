@@ -1,7 +1,3 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/
-
 // convert a ROS1 .bag file to an mcap file with protobuf schema and message encoding
 
 import { Bag } from "@foxglove/rosbag";
@@ -10,12 +6,15 @@ import { parse as parseMessageDefinition } from "@foxglove/rosmsg";
 import { Time } from "@foxglove/rosmsg-serialization";
 import { toNanoSec } from "@foxglove/rostime";
 import Bzip2 from "@foxglove/wasm-bz2";
-import { McapWriter, IWritable, McapTypes } from "@mcap/core";
+import decompressLZ4 from "@foxglove/wasm-lz4";
+import zstd from "@foxglove/wasm-zstd";
+import { McapWriter, McapTypes } from "@mcap/core";
+import { FileHandleWritable } from "@mcap/nodejs";
+import { ProtobufDescriptor, protobufToDescriptor } from "@mcap/support";
 import { program } from "commander";
-import { open, FileHandle } from "fs/promises";
+import { open } from "fs/promises";
 import protobufjs from "protobufjs";
 import descriptor from "protobufjs/ext/descriptor";
-import decompressLZ4 from "wasm-lz4";
 
 const builtinSrc = `
 syntax = "proto3";
@@ -54,7 +53,7 @@ function rosMsgDefinitionToProto(
   msgDef: string,
 ): {
   rootType: protobufjs.Type;
-  descriptorSet: ReturnType<protobufjs.Root["toDescriptor"]>;
+  descriptorSet: ProtobufDescriptor;
   schemaName: string;
 } {
   const definitionArr = parseMessageDefinition(msgDef);
@@ -87,7 +86,6 @@ function rosMsgDefinitionToProto(
     let fieldNumber = 1;
     for (const field of def.definitions) {
       if (field.isConstant === true) {
-        // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
         fields.push(`// ${field.type} ${field.name} = ${field.valueText ?? field.value ?? ""}`);
         continue;
       }
@@ -153,7 +151,7 @@ function rosMsgDefinitionToProto(
   const rootType = root.lookupType(schemaName);
 
   // create a descriptor message for the root
-  const descriptorSet = root.toDescriptor("proto3");
+  const descriptorSet = protobufToDescriptor(root);
   for (const file of descriptorSet.file) {
     // Strip leading `.` from the package names to make them relative to the descriptor
     file.package = file.package?.substring(1);
@@ -193,27 +191,9 @@ function convertTypedArrays(msg: Record<string, unknown>): Record<string, unknow
   return msg;
 }
 
-// IWritable interface for FileHandle
-class FileHandleWritable implements IWritable {
-  private handle: FileHandle;
-  private totalBytesWritten = 0;
-
-  constructor(handle: FileHandle) {
-    this.handle = handle;
-  }
-
-  async write(buffer: Uint8Array): Promise<void> {
-    const written = await this.handle.write(buffer);
-    this.totalBytesWritten += written.bytesWritten;
-  }
-
-  position(): bigint {
-    return BigInt(this.totalBytesWritten);
-  }
-}
-
 async function convert(filePath: string, options: { indexed: boolean }) {
   await decompressLZ4.isLoaded;
+  await zstd.isLoaded;
   const bzip2 = await Bzip2.init();
 
   const bag = new Bag(new FileReader(filePath));
@@ -230,16 +210,15 @@ async function convert(filePath: string, options: { indexed: boolean }) {
     useStatistics: true,
     useChunks: options.indexed,
     useChunkIndex: options.indexed,
+    compressChunk: (data) => ({
+      compression: "zstd",
+      compressedData: zstd.compress(data, 19),
+    }),
   });
 
   await mcapFile.start({
     profile: "",
-    library: "mcap typescript bag2proto",
-  });
-
-  await mcapFile.addMetadata({
-    name: "original file info",
-    metadata: new Map([["path", mcapFilePath]]),
+    library: "mcap typescript bag2mcap",
   });
 
   const topicToDetailMap = new Map<string, TopicDetail>();

@@ -1,7 +1,7 @@
 from io import BytesIO
 from math import inf
 
-from mcap_ros2.cdr import CdrReader, CdrWriter, EncapsulationKind
+from mcap_ros2._cdr import CdrReader, CdrWriter, EncapsulationKind
 
 tf2_msg__TFMessage = (
     "0001000001000000cce0d158f08cf9060a000000626173655f6c696e6b00000006000000"
@@ -14,6 +14,7 @@ rcl_interfaces__ParameterEvent = (
     "000000000100000000000000000000000000000000000000000000000000000000000000"
     "00000000"
 )
+std_msgs__Empty = "0001000000"
 
 
 def test_parse_tfmessage():
@@ -43,7 +44,7 @@ def test_parse_tfmessage():
     assert reader.decoded_bytes() == len(data)
 
 
-def test_parse_parameterevent():
+def test_parse_parameter_event():
     data = bytes.fromhex(rcl_interfaces__ParameterEvent)
     reader = CdrReader(data)
 
@@ -78,6 +79,13 @@ def test_parse_parameterevent():
     # Parameter[] deleted_parameters
     assert reader.sequence_length() == 0
 
+    assert reader.decoded_bytes() == len(data)
+
+
+def test_parse_empty_msg():
+    data = bytes.fromhex(std_msgs__Empty)
+    reader = CdrReader(data)
+    assert reader.uint8() == 0  # uint8 structure_needs_at_least_one_member
     assert reader.decoded_bytes() == len(data)
 
 

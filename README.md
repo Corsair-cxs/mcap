@@ -1,13 +1,15 @@
+<img src="/website/static/img/mcap.png" alt="MCAP logo" width="150px" height="150px"/>
+
 # MCAP
 
 MCAP is a modular container format and logging library for pub/sub messages with arbitrary message serialization. It is primarily intended for use in robotics applications, and works well under various workloads, resource constraints, and durability requirements.
 
 ## Documentation
 
-- [File format specification](./docs/specification)
-  - [Kaitai Struct definition](./docs/specification/mcap.ksy)
-- [Motivation](./docs/motivation/evaluation-of-robotics-data-recording-file-formats.md)
-- [Support Matrix](./docs/support-matrix.md)
+- [File format specification](https://mcap.dev/spec)
+  - [Kaitai Struct definition](./website/docs/spec/mcap.ksy)
+- [Motivation](https://mcap.dev/files/evaluation.pdf)
+- [Support Matrix](https://mcap.dev/reference)
 
 ## Developer quick start
 
@@ -27,8 +29,89 @@ which is used to store the test logs under `tests/conformance/data`.
 
 ## CLI tool
 
-A CLI tool for interacting with the format is available [here](./go/cli/mcap).
+Interact with MCAP files from the command line using the [MCAP CLI tool](./go/cli/mcap).
+
+Download the latest `mcap-cli` version from the [releases page](https://github.com/foxglove/mcap/releases).
 
 ## License
 
 [MIT License](/LICENSE). Contributors are required to accept the [Contributor License Agreement](https://github.com/foxglove/cla).
+
+## Release process
+
+Release numbering follows a major.minor.patch format, abbreviated as "X.Y.Z" below.
+
+CI will build the appropriate packages once tags are pushed, as described below.
+
+### Go library
+
+1. Update the `Version` in go/mcap/version.go
+2. Tag a release matching the version number `go/mcap/vX.Y.Z`.
+
+### CLI
+
+Tag a release matching `releases/mcap-cli/vX.Y.Z`.
+
+The version number is set at build time based on the tag.
+
+### C++
+
+1. Update the version in all relevant files
+   - cpp/bench/conanfile.py
+   - cpp/build-docs.sh
+   - cpp/build.sh
+   - cpp/docs/conanfile.py
+   - cpp/examples/conanfile.py
+   - cpp/mcap/include/mcap/types.hpp (`MCAP_LIBRARY_VERSION`)
+   - cpp/mcap/include/conanfile.py
+   - cpp/test/conanfile.py
+2. Tag a release matching the version number `releases/cpp/vX.Y.Z`
+
+### Python
+
+There are several python packages; updating any follows a similar process.
+
+1. Update the version in the appropriate `__init.py__` file
+2. Tag a release
+   - For the core mcap library, match the pattern `releases/python/vX.Y.Z`
+   - For other packages, use `releases/python/PACKAGE/vX.Y.Z`
+     - For example, `releases/python/mcap/v1.2.3`
+
+### TypeScript
+
+There are several TS packages; updating any follows a similar process.
+
+1. Update the version in the appropriate `package.json`
+2. Tag a release matching `releases/typescript/PACKAGE/vX.Y.Z`
+   - For example, `releases/typescript/core/v1.2.3`
+
+### Swift
+
+Tag a release matching the version number `releases/swift/vX.Y.Z`
+
+### Rust
+
+1. Update the version in rust/Cargo.toml
+2. Tag a release matching the version number `releases/rust/vX.Y.Z`
+
+## Citations
+
+If you use MCAP in your research, please cite it in your work. Our suggested
+citation format is:
+
+```
+@software{MCAP,
+  title = {MCAP: serialization-agnostic log container file format},
+  author = {{Foxglove Developers}},
+  url = {https://mcap.dev},
+  version = {your version},
+  date = {your date of access},
+  year = {2024},
+  publisher = {{Foxglove Technologies}},
+  note = {Available from https://github.com/foxglove/mcap}
+}
+```
+
+Please replace the version and date fields with the version of the software you
+used, and the date you obtained it. Citing MCAP will help spread awareness of
+the project and strengthen the ecosystem.

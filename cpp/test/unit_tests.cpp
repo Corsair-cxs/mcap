@@ -79,7 +79,7 @@ TEST_CASE("internal::crc32", "[writer]") {
   };
 
   std::array<uint8_t, 32> data;
-  std::iota(data.begin(), data.end(), 1);
+  std::iota(data.begin(), data.end(), (uint8_t)(1));
 
   REQUIRE(crc32(data.data(), 0) == 0);
   REQUIRE(crc32(data.data(), 1) == 2768625435);
@@ -476,8 +476,115 @@ TEST_CASE("McapReader::readMessages()", "[reader]") {
 
     reader.close();
   }
+
+  SECTION("IteratorComparison") {
+    Buffer buffer;
+
+    mcap::McapWriter writer;
+    writer.open(buffer, mcap::McapWriterOptions("test"));
+    mcap::Schema schema("schema", "schemaEncoding", "ab");
+    writer.addSchema(schema);
+    mcap::Channel channel("topic", "messageEncoding", schema.id);
+    writer.addChannel(channel);
+    std::vector<std::byte> data = {std::byte(1), std::byte(2), std::byte(3)};
+    WriteMsg(writer, channel.id, 0, 2, 1, data);
+    WriteMsg(writer, channel.id, 1, 4, 3, data);
+    writer.close();
+
+    mcap::McapReader reader;
+    requireOk(reader.open(buffer));
+
+    auto view = reader.readMessages();
+    auto it = view.begin();
+    REQUIRE(it != view.end());
+    REQUIRE(it == view.begin());
+    REQUIRE(it == it);
+    ++it;
+    REQUIRE(it != view.end());
+    REQUIRE(it != view.begin());
+    REQUIRE(it == it);
+    ++it;
+    REQUIRE(it == view.end());
+    REQUIRE(it != view.begin());
+    REQUIRE(it == it);
+
+    reader.close();
+  }
+  SECTION("IteratorComparisonEmpty") {
+    Buffer buffer;
+
+    mcap::McapWriter writer;
+    writer.open(buffer, mcap::McapWriterOptions("test"));
+    writer.close();
+
+    mcap::McapReader reader;
+    requireOk(reader.open(buffer));
+
+    auto view = reader.readMessages();
+    auto it = view.begin();
+    REQUIRE(it == view.begin());
+    REQUIRE(it == view.end());
+    reader.close();
+  }
 }
 
+/**
+ * @brief ensures that message index records are only written for the channels present in the
+ * previous chunk. This test writes two chunks with one message each in separate channels.
+ * If the writer is working correctly, there will be one message index record after each chunk,
+ * one for each message.
+ */
+TEST_CASE("Message index records", "[writer]") {
+  Buffer buffer;
+
+  mcap::McapWriter writer;
+  mcap::McapWriterOptions opts("test");
+  opts.chunkSize = 100;
+  opts.compression = mcap::Compression::None;
+
+  writer.open(buffer, opts);
+
+  mcap::Schema schema("schema", "schemaEncoding", "ab");
+  writer.addSchema(schema);
+  mcap::Channel channel1("topic", "messageEncoding", schema.id);
+  writer.addChannel(channel1);
+  mcap::Channel channel2("topic", "messageEncoding", schema.id);
+  writer.addChannel(channel2);
+
+  mcap::Message msg;
+  std::vector<std::byte> data(150);
+  WriteMsg(writer, channel1.id, 0, 100, 100, data);
+  WriteMsg(writer, channel2.id, 0, 200, 200, data);
+
+  writer.close();
+
+  // read the records after the starting magic, stopping before the end magic.
+  mcap::RecordReader reader(buffer, sizeof(mcap::Magic), buffer.size() - sizeof(mcap::Magic));
+
+  std::vector<uint16_t> messageIndexChannelIds;
+  uint32_t chunkCount = 0;
+
+  for (std::optional<mcap::Record> rec = reader.next(); rec != std::nullopt; rec = reader.next()) {
+    requireOk(reader.status());
+    if (rec->opcode == mcap::OpCode::MessageIndex) {
+      mcap::MessageIndex index;
+      requireOk(mcap::McapReader::ParseMessageIndex(*rec, &index));
+      REQUIRE(index.records.size() == 1);
+      messageIndexChannelIds.push_back(index.channelId);
+    }
+    if (rec->opcode == mcap::OpCode::Chunk) {
+      chunkCount++;
+    }
+  }
+  requireOk(reader.status());
+
+  REQUIRE(chunkCount == 2);
+  REQUIRE(messageIndexChannelIds.size() == 2);
+  REQUIRE(messageIndexChannelIds[0] == channel1.id);
+  REQUIRE(messageIndexChannelIds[1] == channel2.id);
+}
+
+#ifndef MCAP_COMPRESSION_NO_LZ4
 TEST_CASE("LZ4 compression", "[reader][writer]") {
   SECTION("Roundtrip") {
     Buffer buffer;
@@ -520,13 +627,62 @@ TEST_CASE("LZ4 compression", "[reader][writer]") {
 
     reader.close();
   }
+}
+#endif
 
+#ifndef MCAP_COMPRESSION_NO_LZ4
+TEST_CASE("zstd compression", "[reader][writer]") {
+  SECTION("Roundtrip") {
+    Buffer buffer;
+
+    mcap::McapWriter writer;
+    mcap::McapWriterOptions opts("test");
+    opts.compression = mcap::Compression::Zstd;
+    opts.forceCompression = true;
+    writer.open(buffer, opts);
+    mcap::Schema schema("schema", "schemaEncoding", "ab");
+    writer.addSchema(schema);
+    mcap::Channel channel("topic", "messageEncoding", schema.id);
+    writer.addChannel(channel);
+
+    mcap::Message msg;
+    std::vector<std::byte> data = {std::byte(1), std::byte(2), std::byte(3)};
+    WriteMsg(writer, channel.id, 0, 2, 1, data);
+
+    writer.close();
+
+    mcap::McapReader reader;
+    auto status = reader.open(buffer);
+    requireOk(status);
+
+    size_t messageCount = 0;
+    const auto onProblem = [](const mcap::Status& status) {
+      FAIL("Status " + std::to_string((int)status.code) + ": " + status.message);
+    };
+    for (const auto& msgView : reader.readMessages(onProblem)) {
+      ++messageCount;
+      REQUIRE(msgView.message.sequence == 0);
+      REQUIRE(msgView.message.channelId == channel.id);
+      REQUIRE(msgView.message.logTime == 2);
+      REQUIRE(msgView.message.publishTime == 1);
+      REQUIRE(msgView.message.dataSize == data.size());
+      REQUIRE(std::vector(msgView.message.data, msgView.message.data + msgView.message.dataSize) ==
+              data);
+    }
+    REQUIRE(messageCount == 1);
+
+    reader.close();
+  }
+}
+#endif
+
+TEST_CASE("Read Order", "[reader][writer]") {
   SECTION("Roundtrip two topics") {
     Buffer buffer;
 
     mcap::McapWriter writer;
     mcap::McapWriterOptions opts("test");
-    opts.compression = mcap::Compression::Lz4;
+    opts.compression = mcap::Compression::None;
     opts.forceCompression = true;
     writer.open(buffer, opts);
     mcap::Schema schema1("schema1", "schemaEncoding", "ab");
@@ -570,15 +726,12 @@ TEST_CASE("LZ4 compression", "[reader][writer]") {
 
     reader.close();
   }
-}
-
-TEST_CASE("Read Order", "[reader][writer]") {
   SECTION("Roundtrip unordered") {
     Buffer buffer;
 
     mcap::McapWriter writer;
     mcap::McapWriterOptions opts("test");
-    opts.compression = mcap::Compression::Lz4;
+    opts.compression = mcap::Compression::None;
     opts.forceCompression = true;
     writer.open(buffer, opts);
     mcap::Schema schema("schema", "schemaEncoding", "ab");
@@ -625,4 +778,279 @@ TEST_CASE("Read Order", "[reader][writer]") {
 
     reader.close();
   }
+  SECTION("total ordering fallback to offset (chunked)") {
+    Buffer buffer;
+
+    mcap::McapWriter writer;
+    mcap::McapWriterOptions opts("test");
+    opts.compression = mcap::Compression::None;
+    writer.open(buffer, opts);
+    mcap::Schema schema("schema", "schemaEncoding", "ab");
+    writer.addSchema(schema);
+    mcap::Channel channel("topic", "messageEncoding", schema.id);
+    writer.addChannel(channel);
+
+    mcap::Message msg;
+    std::vector<std::byte> data = {std::byte(1), std::byte(2), std::byte(3)};
+    WriteMsg(writer, channel.id, 0, 100, 100, data);
+    WriteMsg(writer, channel.id, 1, 100, 100, data);
+    WriteMsg(writer, channel.id, 2, 100, 100, data);
+    WriteMsg(writer, channel.id, 3, 300, 300, data);
+    WriteMsg(writer, channel.id, 4, 300, 300, data);
+    WriteMsg(writer, channel.id, 5, 300, 300, data);
+    WriteMsg(writer, channel.id, 6, 200, 200, data);
+    writer.close();
+
+    mcap::McapReader reader;
+    auto status = reader.open(buffer);
+    requireOk(status);
+
+    const auto onProblem = [](const mcap::Status& status) {
+      FAIL("Status " + std::to_string((int)status.code) + ": " + status.message);
+    };
+
+    mcap::ReadMessageOptions options;
+    options.readOrder = mcap::ReadMessageOptions::ReadOrder::LogTimeOrder;
+    size_t count = 0;
+    const std::vector<uint32_t> forward_order_expected = {0, 1, 2, 6, 3, 4, 5};
+    for (const auto& msgView : reader.readMessages(onProblem, options)) {
+      REQUIRE(msgView.message.sequence == forward_order_expected[count]);
+      count++;
+    }
+    REQUIRE(count == forward_order_expected.size());
+    const std::vector<uint32_t> reverse_order_expected = {5, 4, 3, 6, 2, 1, 0};
+    count = 0;
+    options.readOrder = mcap::ReadMessageOptions::ReadOrder::ReverseLogTimeOrder;
+    for (const auto& msgView : reader.readMessages(onProblem, options)) {
+      REQUIRE(msgView.message.sequence == reverse_order_expected[count]);
+      count++;
+    }
+    REQUIRE(count == reverse_order_expected.size());
+  }
+}
+
+TEST_CASE("ReadJobQueue order", "[reader]") {
+  SECTION("successive chunks with out-of-order timestamps") {
+    mcap::internal::ReadJobQueue q(false);
+    {
+      mcap::internal::DecompressChunkJob chunk;
+      chunk.messageStartTime = 100;
+      chunk.messageEndTime = 200;
+      chunk.chunkStartOffset = 1000;
+      chunk.messageIndexEndOffset = 2000;
+      q.push(std::move(chunk));
+    }
+    {
+      mcap::internal::DecompressChunkJob chunk;
+      chunk.messageStartTime = 0;
+      chunk.messageEndTime = 100;
+      chunk.chunkStartOffset = 2000;
+      chunk.messageIndexEndOffset = 3000;
+      q.push(std::move(chunk));
+    }
+
+    {
+      auto result = q.pop();
+      REQUIRE(std::get<mcap::internal::DecompressChunkJob>(result).messageStartTime == 0);
+      REQUIRE(std::get<mcap::internal::DecompressChunkJob>(result).chunkStartOffset == 2000);
+    }
+    {
+      auto result = q.pop();
+      REQUIRE(std::get<mcap::internal::DecompressChunkJob>(result).messageStartTime == 100);
+      REQUIRE(std::get<mcap::internal::DecompressChunkJob>(result).chunkStartOffset == 1000);
+    }
+  }
+  SECTION("reverse time order: successive chunks with out-of-order timestamps") {
+    mcap::internal::ReadJobQueue q(true);
+    {
+      mcap::internal::DecompressChunkJob chunk;
+      chunk.messageStartTime = 100;
+      chunk.messageEndTime = 200;
+      chunk.chunkStartOffset = 1000;
+      chunk.messageIndexEndOffset = 2000;
+      q.push(std::move(chunk));
+    }
+    {
+      mcap::internal::DecompressChunkJob chunk;
+      chunk.messageStartTime = 0;
+      chunk.messageEndTime = 100;
+      chunk.chunkStartOffset = 2000;
+      chunk.messageIndexEndOffset = 3000;
+      q.push(std::move(chunk));
+    }
+
+    {
+      auto result = q.pop();
+      REQUIRE(std::holds_alternative<mcap::internal::DecompressChunkJob>(result));
+      REQUIRE(std::get<mcap::internal::DecompressChunkJob>(result).messageStartTime == 100);
+      REQUIRE(std::get<mcap::internal::DecompressChunkJob>(result).chunkStartOffset == 1000);
+    }
+    {
+      auto result = q.pop();
+      REQUIRE(std::holds_alternative<mcap::internal::DecompressChunkJob>(result));
+      REQUIRE(std::get<mcap::internal::DecompressChunkJob>(result).messageStartTime == 0);
+      REQUIRE(std::get<mcap::internal::DecompressChunkJob>(result).chunkStartOffset == 2000);
+    }
+  }
+}
+
+TEST_CASE("RecordOffset equality operators", "[reader]") {
+  SECTION("non-equal records outside chunk") {
+    mcap::RecordOffset a(10);
+    mcap::RecordOffset b(20);
+
+    REQUIRE(a != b);
+    REQUIRE(b != a);
+
+    REQUIRE(a < b);
+    REQUIRE(!(b < a));
+
+    REQUIRE(a <= b);
+    REQUIRE(!(b <= a));
+
+    REQUIRE(!(a > b));
+    REQUIRE(b > a);
+
+    REQUIRE(!(a >= b));
+    REQUIRE(b >= a);
+  }
+
+  SECTION("equal records outside chunk") {
+    mcap::RecordOffset a(10);
+    mcap::RecordOffset b(10);
+
+    REQUIRE(a == b);
+    REQUIRE(b == a);
+
+    REQUIRE(!(a < b));
+    REQUIRE(!(b < a));
+
+    REQUIRE(a <= b);
+    REQUIRE(b <= a);
+
+    REQUIRE(!(a > b));
+    REQUIRE(!(b > a));
+
+    REQUIRE(a >= b);
+    REQUIRE(b >= a);
+  }
+
+  SECTION("non-equal records in same chunk") {
+    mcap::RecordOffset a(10, 30);
+    mcap::RecordOffset b(20, 30);
+
+    REQUIRE(a != b);
+    REQUIRE(b != a);
+
+    REQUIRE(a < b);
+    REQUIRE(!(b < a));
+
+    REQUIRE(a <= b);
+    REQUIRE(!(b <= a));
+
+    REQUIRE(!(a > b));
+    REQUIRE(b > a);
+
+    REQUIRE(!(a >= b));
+    REQUIRE(b >= a);
+  }
+
+  SECTION("equal records inside chunk") {
+    mcap::RecordOffset a(10, 30);
+    mcap::RecordOffset b(10, 30);
+
+    REQUIRE(a == b);
+    REQUIRE(b == a);
+
+    REQUIRE(!(a < b));
+    REQUIRE(!(b < a));
+
+    REQUIRE(a <= b);
+    REQUIRE(b <= a);
+
+    REQUIRE(!(a > b));
+    REQUIRE(!(b > a));
+
+    REQUIRE(a >= b);
+    REQUIRE(b >= a);
+  }
+
+  SECTION("non-equal records in same chunk") {
+    mcap::RecordOffset a(10, 30);
+    mcap::RecordOffset b(20, 30);
+
+    REQUIRE(a != b);
+    REQUIRE(b != a);
+
+    REQUIRE(a < b);
+    REQUIRE(!(b < a));
+
+    REQUIRE(a <= b);
+    REQUIRE(!(b <= a));
+
+    REQUIRE(!(a > b));
+    REQUIRE(b > a);
+
+    REQUIRE(!(a >= b));
+    REQUIRE(b >= a);
+  }
+
+  SECTION("equally-offset records in different chunks") {
+    mcap::RecordOffset a(10, 30);
+    mcap::RecordOffset b(10, 40);
+
+    REQUIRE(a != b);
+    REQUIRE(b != a);
+
+    REQUIRE(a < b);
+    REQUIRE(!(b < a));
+
+    REQUIRE(a <= b);
+    REQUIRE(!(b <= a));
+
+    REQUIRE(!(a > b));
+    REQUIRE(b > a);
+
+    REQUIRE(!(a >= b));
+    REQUIRE(b >= a);
+  }
+
+  SECTION("oppositely-offset records in different chunks") {
+    mcap::RecordOffset a(20, 30);
+    mcap::RecordOffset b(10, 40);
+
+    REQUIRE(a != b);
+    REQUIRE(b != a);
+
+    REQUIRE(a < b);
+    REQUIRE(!(b < a));
+
+    REQUIRE(a <= b);
+    REQUIRE(!(b <= a));
+
+    REQUIRE(!(a > b));
+    REQUIRE(b > a);
+
+    REQUIRE(!(a >= b));
+    REQUIRE(b >= a);
+  }
+}
+
+TEST_CASE("parsing", "header") {
+  Buffer buffer;
+  mcap::McapWriter writer;
+  mcap::McapWriterOptions opts("my-profile");
+  opts.library = "my-library";
+  writer.open(buffer, opts);
+  writer.close();
+
+  mcap::McapReader reader;
+  auto status = reader.open(buffer);
+  requireOk(status);
+
+  auto header = reader.header();
+  REQUIRE(header != std::nullopt);
+
+  REQUIRE(header->library == "my-library");
+  REQUIRE(header->profile == "my-profile");
 }

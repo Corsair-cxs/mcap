@@ -1,4 +1,4 @@
-""" Example script for converting pointcloud CSV data to an MCAP viewable in Foxglove Studio.
+""" Example script for converting pointcloud CSV data to an MCAP viewable in Foxglove.
 
 This script uses the public CSV dataset "Sydney Urban Objects Dataset",
 released by the Australian Centre for Field Robotics at the University of Sydney, NSW, Australia.
@@ -10,6 +10,7 @@ usage:
   pip install mcap
   python3 pointcloud_csv_to_mcap.py sydney-urban-objects-dataset/objects/4wd.0.2299.csv -o out.mcap
 """
+
 import argparse
 import base64
 import csv
@@ -20,8 +21,8 @@ import typing
 from pathlib import Path
 
 # tutorial-mcap-imports-start
+from mcap.well_known import MessageEncoding, SchemaEncoding
 from mcap.writer import Writer
-from mcap.well_known import SchemaEncoding, MessageEncoding
 
 # tutorial-mcap-imports-end
 
@@ -29,8 +30,8 @@ from mcap.well_known import SchemaEncoding, MessageEncoding
 # tutorial-csv-decode-start
 def point_reader(csv_path: typing.Union[str, Path]):
     with open(csv_path, "r") as f:
-        for timestring, i, _, x, y, z, _, _, _ in csv.reader(f):
-            timestamp = datetime.datetime.strptime(timestring, "%Y%m%dT%H%M%S.%f")
+        for time_string, i, _, x, y, z, _, _, _ in csv.reader(f):
+            timestamp = datetime.datetime.strptime(time_string, "%Y%m%dT%H%M%S.%f")
             yield (timestamp, float(i), float(x), float(y), float(z))
             # tutorial-csv-decode-end
 

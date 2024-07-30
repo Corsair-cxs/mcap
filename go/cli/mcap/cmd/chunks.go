@@ -42,21 +42,22 @@ func printChunks(w io.Writer, chunkIndexes []*mcap.ChunkIndex) {
 	utils.FormatTable(w, rows)
 }
 
-// chunksCmd represents the chunks command
+// chunksCmd represents the chunks command.
 var chunksCmd = &cobra.Command{
 	Use:   "chunks",
 	Short: "List chunks in an MCAP file",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, args []string) {
 		ctx := context.Background()
 		if len(args) != 1 {
 			die("Unexpected number of args")
 		}
 		filename := args[0]
-		err := utils.WithReader(ctx, filename, func(matched bool, rs io.ReadSeeker) error {
+		err := utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
 			reader, err := mcap.NewReader(rs)
 			if err != nil {
 				return fmt.Errorf("failed to get reader: %w", err)
 			}
+			defer reader.Close()
 			info, err := reader.Info()
 			if err != nil {
 				return fmt.Errorf("failed to get info: %w", err)

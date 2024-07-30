@@ -55,20 +55,22 @@ export function parseRecord({
   if (recordLength > Number.MAX_SAFE_INTEGER) {
     throw new Error(`Record content length ${recordLength} is too large`);
   }
-  const recordEndOffset = headerReader.offset + Number(recordLength);
+  const recordLengthNum = Number(recordLength);
+  const recordEndOffset = headerReader.offset + recordLengthNum;
   if (recordEndOffset > view.byteLength) {
     return { usedBytes: 0 };
   }
 
   if (!isKnownOpcode(opcode)) {
+    const data = new Uint8Array(
+      view.buffer,
+      view.byteOffset + headerReader.offset,
+      recordLengthNum,
+    );
     const record: TypedMcapRecord = {
       type: "Unknown",
       opcode,
-      data: new Uint8Array(
-        view.buffer,
-        view.byteOffset + headerReader.offset,
-        Number(recordLength),
-      ),
+      data,
     };
     return { record, usedBytes: recordEndOffset - startOffset };
   }
@@ -76,7 +78,7 @@ export function parseRecord({
   const recordView = new DataView(
     view.buffer,
     view.byteOffset + headerReader.offset,
-    Number(recordLength),
+    recordLengthNum,
   );
   const reader = new Reader(recordView);
 
@@ -110,11 +112,10 @@ export function parseRecord({
         throw new Error(`Schema data length ${dataLen} exceeds bounds of record`);
       }
       const data = new Uint8Array(
-        recordView.buffer.slice(
-          recordView.byteOffset + reader.offset,
-          recordView.byteOffset + reader.offset + dataLen,
-        ),
-      );
+        recordView.buffer,
+        recordView.byteOffset + reader.offset,
+        dataLen,
+      ).slice();
       reader.offset += dataLen;
 
       const record: TypedMcapRecord = {
@@ -156,11 +157,10 @@ export function parseRecord({
       const logTime = reader.uint64();
       const publishTime = reader.uint64();
       const data = new Uint8Array(
-        recordView.buffer.slice(
-          recordView.byteOffset + reader.offset,
-          recordView.byteOffset + recordView.byteLength,
-        ),
-      );
+        recordView.buffer,
+        recordView.byteOffset + reader.offset,
+        recordView.byteLength - reader.offset,
+      ).slice();
       const record: TypedMcapRecord = {
         type: "Message",
         channelId,
@@ -183,11 +183,10 @@ export function parseRecord({
         throw new Error("Chunk records length exceeds remaining record size");
       }
       const records = new Uint8Array(
-        recordView.buffer.slice(
-          recordView.byteOffset + reader.offset,
-          recordView.byteOffset + reader.offset + recordByteLength,
-        ),
-      );
+        recordView.buffer,
+        recordView.byteOffset + reader.offset,
+        recordByteLength,
+      ).slice();
       const record: TypedMcapRecord = {
         type: "Chunk",
         messageStartTime: startTime,
@@ -253,11 +252,10 @@ export function parseRecord({
         throw new Error(`Attachment data length ${dataLen} exceeds bounds of record`);
       }
       const data = new Uint8Array(
-        recordView.buffer.slice(
-          recordView.byteOffset + reader.offset,
-          recordView.byteOffset + reader.offset + Number(dataLen),
-        ),
-      );
+        recordView.buffer,
+        recordView.byteOffset + reader.offset,
+        Number(dataLen),
+      ).slice();
       reader.offset += Number(dataLen);
       const crcLength = reader.offset;
       const expectedCrc = reader.uint32();

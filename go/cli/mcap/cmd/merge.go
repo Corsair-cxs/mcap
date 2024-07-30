@@ -2,6 +2,10 @@ package cmd
 
 import (
 	"container/heap"
+	"crypto/md5"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,60 +13,87 @@ import (
 
 	"github.com/foxglove/mcap/go/cli/mcap/utils"
 	"github.com/foxglove/mcap/go/mcap"
-	"github.com/foxglove/mcap/go/mcap/readopts"
 	"github.com/spf13/cobra"
 )
 
+type ErrDuplicateMetadataName struct {
+	Name string
+}
+
+func (e ErrDuplicateMetadataName) Is(target error) bool {
+	_, ok := target.(*ErrDuplicateMetadataName)
+	return ok
+}
+
+func (e *ErrDuplicateMetadataName) Error() string {
+	return fmt.Sprintf("metadata name '%s' was previously encountered. "+
+		"Supply --allow-duplicate-metadata to override.", e.Name)
+}
+
 var (
-	mergeCompression string
-	mergeChunkSize   int64
-	mergeIncludeCRC  bool
-	mergeChunked     bool
-	mergeOutputFile  string
+	mergeCompression            string
+	mergeChunkSize              int64
+	mergeIncludeCRC             bool
+	mergeChunked                bool
+	mergeOutputFile             string
+	mergeAllowDuplicateMetadata bool
+	coalesceChannels            string
 )
 
 type mergeOpts struct {
-	compression string
-	chunkSize   int64
-	includeCRC  bool
-	chunked     bool
+	compression            string
+	chunkSize              int64
+	includeCRC             bool
+	chunked                bool
+	allowDuplicateMetadata bool
+	coalesceChannels       string
 }
 
-// schemaID uniquely identifies a schema across the inputs
+// schemaID uniquely identifies a schema across the inputs.
 type schemaID struct {
 	inputID  int
 	schemaID uint16
 }
 
-// channelID uniquely identifies a channel across the inputs
+// channelID uniquely identifies a channel across the inputs.
 type channelID struct {
 	inputID   int
 	channelID uint16
 }
 
+type HashSum = [md5.Size]byte
+
 type mcapMerger struct {
-	schemas    map[schemaID]*mcap.Schema
-	channels   map[channelID]*mcap.Channel
-	schemaIDs  map[schemaID]uint16
-	channelIDs map[channelID]uint16
-
-	outputChannelSchemas map[uint16]uint16
-
-	nextChannelID uint16
-	nextSchemaID  uint16
-	opts          mergeOpts
+	schemaIDs       map[schemaID]uint16
+	channelIDs      map[channelID]uint16
+	schemaIDByHash  map[HashSum]uint16
+	channelIDByHash map[HashSum]uint16
+	metadataHashes  map[string]bool
+	metadataNames   map[string]bool
+	nextChannelID   uint16
+	nextSchemaID    uint16
+	opts            mergeOpts
 }
+
+const (
+	AutoCoalescing  = "auto"
+	ForceCoalescing = "force"
+	NoCoalescing    = "none"
+
+	compressionNoneAlias = "none"
+)
 
 func newMCAPMerger(opts mergeOpts) *mcapMerger {
 	return &mcapMerger{
-		schemas:              make(map[schemaID]*mcap.Schema),
-		channels:             make(map[channelID]*mcap.Channel),
-		schemaIDs:            make(map[schemaID]uint16),
-		channelIDs:           make(map[channelID]uint16),
-		outputChannelSchemas: make(map[uint16]uint16),
-		nextChannelID:        1,
-		nextSchemaID:         1,
-		opts:                 opts,
+		schemaIDs:       make(map[schemaID]uint16),
+		channelIDs:      make(map[channelID]uint16),
+		schemaIDByHash:  make(map[HashSum]uint16),
+		channelIDByHash: make(map[HashSum]uint16),
+		metadataHashes:  make(map[string]bool),
+		metadataNames:   make(map[string]bool),
+		nextChannelID:   1,
+		nextSchemaID:    1,
+		opts:            opts,
 	}
 }
 
@@ -75,11 +106,68 @@ func (m *mcapMerger) outputChannelID(inputID int, inputChannelID uint16) (uint16
 }
 
 func (m *mcapMerger) outputSchemaID(inputID int, inputSchemaID uint16) (uint16, bool) {
+	if inputSchemaID == 0 {
+		return 0, true
+	}
 	v, ok := m.schemaIDs[schemaID{
 		inputID:  inputID,
 		schemaID: inputSchemaID,
 	}]
 	return v, ok
+}
+
+func hashMetadata(metadata *mcap.Metadata) (string, error) {
+	hasher := md5.New()
+	hasher.Write([]byte(metadata.Name))
+	bytes, err := json.Marshal(metadata.Metadata)
+	if err != nil {
+		return "", err
+	}
+	hasher.Write(bytes)
+	hash := hasher.Sum(nil)
+	return hex.EncodeToString(hash), nil
+}
+
+func (m *mcapMerger) addMetadata(w *mcap.Writer, metadata *mcap.Metadata) error {
+	if m.metadataNames[metadata.Name] && !m.opts.allowDuplicateMetadata {
+		return &ErrDuplicateMetadataName{Name: metadata.Name}
+	}
+	hash, err := hashMetadata(metadata)
+	if err != nil {
+		return fmt.Errorf("failed to compute metadata hash: %w", err)
+	}
+	if !m.metadataHashes[hash] {
+		err := w.WriteMetadata(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to write metadata: %w", err)
+		}
+		m.metadataHashes[hash] = true
+		m.metadataNames[metadata.Name] = true
+	}
+	return nil
+}
+
+func getChannelHash(channel *mcap.Channel, coalesceChannels string) HashSum {
+	hasher := md5.New()
+	schemaIDBytes := make([]byte, 2)
+	binary.LittleEndian.PutUint16(schemaIDBytes, channel.SchemaID)
+	hasher.Write(schemaIDBytes)
+	hasher.Write([]byte(channel.Topic))
+	hasher.Write([]byte(channel.MessageEncoding))
+
+	switch coalesceChannels {
+	case AutoCoalescing: // Include channel metadata in hash
+		for key, value := range channel.Metadata {
+			hasher.Write([]byte(key))
+			hasher.Write([]byte(value))
+		}
+	case ForceCoalescing: // Channel metadata is not included in hash
+		break
+	default:
+		die("Invalid value for --coalesce-channels: %s\n", coalesceChannels)
+	}
+
+	return HashSum(hasher.Sum(nil))
 }
 
 func (m *mcapMerger) addChannel(w *mcap.Writer, inputID int, channel *mcap.Channel) (uint16, error) {
@@ -95,7 +183,17 @@ func (m *mcapMerger) addChannel(w *mcap.Writer, inputID int, channel *mcap.Chann
 		MessageEncoding: channel.MessageEncoding,
 		Metadata:        channel.Metadata,
 	}
-	m.channels[key] = channel
+
+	if m.opts.coalesceChannels != NoCoalescing {
+		channelHash := getChannelHash(newChannel, m.opts.coalesceChannels)
+		channelID, channelKnown := m.channelIDByHash[channelHash]
+		if channelKnown {
+			m.channelIDs[key] = channelID
+			return channelID, nil
+		}
+		m.channelIDByHash[channelHash] = m.nextChannelID
+	}
+
 	m.channelIDs[key] = m.nextChannelID
 	err := w.WriteChannel(newChannel)
 	if err != nil {
@@ -105,22 +203,37 @@ func (m *mcapMerger) addChannel(w *mcap.Writer, inputID int, channel *mcap.Chann
 	return newChannel.ID, nil
 }
 
-func (m *mcapMerger) addSchema(w *mcap.Writer, inputID int, schema *mcap.Schema) (uint16, error) {
+func getSchemaHash(schema *mcap.Schema) HashSum {
+	hasher := md5.New()
+	hasher.Write([]byte(schema.Name))
+	hasher.Write([]byte(schema.Encoding))
+	hasher.Write(schema.Data)
+	return HashSum(hasher.Sum(nil))
+}
+
+func (m *mcapMerger) addSchema(w *mcap.Writer, inputID int, schema *mcap.Schema) error {
 	key := schemaID{inputID, schema.ID}
+	schemaHash := getSchemaHash(schema)
+	schemaID, schemaKnown := m.schemaIDByHash[schemaHash]
+	if schemaKnown {
+		m.schemaIDs[key] = schemaID
+		return nil
+	}
+
 	newSchema := &mcap.Schema{
 		ID:       m.nextSchemaID, // substitute the next output schema ID
 		Name:     schema.Name,
 		Encoding: schema.Encoding,
 		Data:     schema.Data,
 	}
-	m.schemas[key] = newSchema
 	m.schemaIDs[key] = m.nextSchemaID
+	m.schemaIDByHash[schemaHash] = m.nextSchemaID
 	err := w.WriteSchema(newSchema)
 	if err != nil {
-		return 0, fmt.Errorf("failed to write schema: %w", err)
+		return fmt.Errorf("failed to write schema: %w", err)
 	}
 	m.nextSchemaID++
-	return newSchema.ID, nil
+	return nil
 }
 
 func outputProfile(profiles []string) string {
@@ -136,7 +249,7 @@ func outputProfile(profiles []string) string {
 	return firstProfile
 }
 
-func (m *mcapMerger) mergeInputs(w io.Writer, inputs []io.Reader) error {
+func (m *mcapMerger) mergeInputs(w io.Writer, inputs []namedReader) error {
 	writer, err := mcap.NewWriter(w, &mcap.WriterOptions{
 		Chunked:     m.opts.chunked,
 		ChunkSize:   m.opts.chunkSize,
@@ -146,25 +259,37 @@ func (m *mcapMerger) mergeInputs(w io.Writer, inputs []io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("failed to create writer: %w", err)
 	}
-	if err != nil {
-		return fmt.Errorf("failed to write header: %w", err)
-	}
 
 	iterators := make([]mcap.MessageIterator, len(inputs))
 	profiles := make([]string, len(inputs))
 	pq := utils.NewPriorityQueue(nil)
 
+	// Reset struct members
+	m.schemaIDByHash = make(map[HashSum]uint16)
+	m.channelIDByHash = make(map[HashSum]uint16)
+	m.schemaIDs = make(map[schemaID]uint16)
+	m.channelIDs = make(map[channelID]uint16)
+	m.nextChannelID = 1
+	m.nextSchemaID = 1
+
 	// for each input reader, initialize an mcap reader and read the first
 	// message off. Insert the schema and channel into the output with
 	// renumbered IDs, and load the message (with renumbered IDs) into the
 	// priority queue.
-	for inputID, inputReader := range inputs {
-		reader, err := mcap.NewReader(inputReader)
+	for inputID, input := range inputs {
+		reader, err := mcap.NewReader(input.reader)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to open reader on %s: %w", input.name, err)
 		}
+		defer reader.Close() //nolint:gocritic // we actually want these deferred in the loop.
 		profiles[inputID] = reader.Header().Profile
-		iterator, err := reader.Messages(readopts.UsingIndex(false))
+		opts := []mcap.ReadOpt{
+			mcap.UsingIndex(false),
+			mcap.WithMetadataCallback(func(metadata *mcap.Metadata) error {
+				return m.addMetadata(writer, metadata)
+			}),
+		}
+		iterator, err := reader.Messages(opts...)
 		if err != nil {
 			return err
 		}
@@ -174,21 +299,24 @@ func (m *mcapMerger) mergeInputs(w io.Writer, inputs []io.Reader) error {
 		return err
 	}
 	for inputID, iterator := range iterators {
-		schema, channel, message, err := iterator.Next(nil)
+		inputName := inputs[inputID].name
+		schema, channel, message, err := iterator.NextInto(nil)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				// the file may be an empty mcap. if so, just ignore it.
 				continue
 			}
-			return fmt.Errorf("failed to read first message on input %d: %w", inputID, err)
+			return fmt.Errorf("error on input %s: %w", inputName, err)
 		}
-		schema.ID, err = m.addSchema(writer, inputID, schema)
-		if err != nil {
-			return fmt.Errorf("failed to add initial schema for input %d: %w", inputID, err)
+		if schema != nil {
+			err = m.addSchema(writer, inputID, schema)
+			if err != nil {
+				return fmt.Errorf("failed to add initial schema for input %s: %w", inputName, err)
+			}
 		}
 		message.ChannelID, err = m.addChannel(writer, inputID, channel)
 		if err != nil {
-			return fmt.Errorf("failed to add initial channel for input %d: %w", inputID, err)
+			return fmt.Errorf("failed to add initial channel for input %s: %w", inputName, err)
 		}
 		// push the first message onto the priority queue
 		heap.Push(pq, utils.NewTaggedMessage(inputID, message))
@@ -208,7 +336,7 @@ func (m *mcapMerger) mergeInputs(w io.Writer, inputs []io.Reader) error {
 		// Pull the next message off the iterator, to replace the one just
 		// popped from the queue. Before pushing this message, it must be
 		// renumbered and the related channels/schemas may need to be inserted.
-		newSchema, newChannel, newMessage, err := iterators[msg.InputID].Next(nil)
+		newSchema, newChannel, newMessage, err := iterators[msg.InputID].NextInto(nil)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				// if the iterator is empty, skip this read. No further messages
@@ -218,50 +346,176 @@ func (m *mcapMerger) mergeInputs(w io.Writer, inputs []io.Reader) error {
 				// will break.
 				continue
 			}
-			return fmt.Errorf("failed to pull next message: %w", err)
+			return fmt.Errorf("error on input on %s: %w", inputs[msg.InputID].name, err)
 		}
 
 		// if the channel is unknown, need to add it to the output
 		var ok bool
 		newMessage.ChannelID, ok = m.outputChannelID(msg.InputID, newChannel.ID)
 		if !ok {
-			_, ok := m.outputSchemaID(msg.InputID, newSchema.ID)
-			if !ok {
-				// if the schema is unknown, add it to the output
-				m.addSchema(writer, msg.InputID, newSchema)
+			if newSchema != nil {
+				_, ok := m.outputSchemaID(msg.InputID, newSchema.ID)
+				if !ok {
+					// if the schema is unknown, add it to the output
+					err := m.addSchema(writer, msg.InputID, newSchema)
+					if err != nil {
+						return fmt.Errorf("failed to add schema from %s: %w", inputs[msg.InputID].name, err)
+					}
+				}
 			}
 			newMessage.ChannelID, err = m.addChannel(writer, msg.InputID, newChannel)
 			if err != nil {
-				return fmt.Errorf("failed to add channel: %w", err)
+				return fmt.Errorf("failed to add channel from %s: %w", inputs[msg.InputID].name, err)
 			}
 		}
 		heap.Push(pq, utils.NewTaggedMessage(msg.InputID, newMessage))
 	}
+
+	// append any attachments as they are encountered. if an input is unindexed,
+	// or doesn't provide an AttachmentCount, we do a second full scan of it.
+	// empty AttachmentIndexes alone doesn't indicate there are no attachments.
+	for _, input := range inputs {
+		_, err := input.reader.Seek(0, io.SeekStart)
+		if err != nil {
+			return fmt.Errorf("failed to seek: %w", err)
+		}
+
+		reader, err := mcap.NewReader(input.reader)
+		if err != nil {
+			return fmt.Errorf("failed to create attachment reader: %w", err)
+		}
+		defer reader.Close() //nolint:gocritic // we actually want these deferred in the loop.
+		info, err := reader.Info()
+		if err == nil &&
+			info != nil &&
+			info.Statistics != nil &&
+			info.Statistics.AttachmentCount == uint32(len(info.AttachmentIndexes)) {
+			err = addIndexedAttachments(reader, writer, info.AttachmentIndexes)
+			if err != nil {
+				return fmt.Errorf("failed to add attachment from indexed file %s: %w", input.name, err)
+			}
+		} else {
+			err = scanForAttachments(&input, writer)
+			if err != nil {
+				return fmt.Errorf("failed to scan attachments from file %s: %w", input.name, err)
+			}
+		}
+	}
+
 	return writer.Close()
 }
 
-// mergeCmd represents the merge command
+// scan only the attachment indexes to add attachments.
+func addIndexedAttachments(reader *mcap.Reader, writer *mcap.Writer, indexes []*mcap.AttachmentIndex) error {
+	for _, index := range indexes {
+		if index == nil {
+			continue
+		}
+		attReader, err := reader.GetAttachmentReader(index.Offset)
+		if err != nil {
+			return fmt.Errorf("failed to read attachment: %w", err)
+		}
+		err = writer.WriteAttachment(&mcap.Attachment{
+			Name:       index.Name,
+			MediaType:  index.MediaType,
+			CreateTime: index.CreateTime,
+			LogTime:    index.LogTime,
+			DataSize:   index.DataSize,
+			Data:       attReader.Data(),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to write attachment: %w", err)
+		}
+	}
+	return nil
+}
+
+// for an unindexed mcap, we need to scan the full file.
+func scanForAttachments(input *namedReader, writer *mcap.Writer) error {
+	_, err := input.reader.Seek(0, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("failed to seek: %w", err)
+	}
+	lexer, err := mcap.NewLexer(input.reader, &mcap.LexerOptions{
+		ComputeAttachmentCRCs: true,
+		AttachmentCallback: func(attReader *mcap.AttachmentReader) error {
+			err := writer.WriteAttachment(&mcap.Attachment{
+				LogTime:    attReader.LogTime,
+				CreateTime: attReader.CreateTime,
+				Name:       attReader.Name,
+				MediaType:  attReader.MediaType,
+				DataSize:   attReader.DataSize,
+				Data:       attReader.Data(),
+			})
+			if err != nil {
+				return fmt.Errorf("failed to write attachment: %w", err)
+			}
+			computed, err := attReader.ComputedCRC()
+			if err != nil {
+				return fmt.Errorf("failed to compute CRC: %w", err)
+			}
+			parsed, err := attReader.ParsedCRC()
+			if err != nil {
+				return fmt.Errorf("failed to parse CRC: %w", err)
+			}
+			if computed != parsed {
+				return fmt.Errorf("CRC check failed: %w", err)
+			}
+
+			return err
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create lexer: %w", err)
+	}
+
+	buf := make([]byte, 1024)
+	for {
+		_, _, err := lexer.Next(buf)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+type namedReader struct {
+	name   string
+	reader io.ReadSeeker
+}
+
+// mergeCmd represents the merge command.
 var mergeCmd = &cobra.Command{
 	Use:   "merge file1.mcap [file2.mcap] [file3.mcap]...",
 	Short: "Merge a selection of MCAP files by record timestamp",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, args []string) {
 		if mergeOutputFile == "" && !utils.StdoutRedirected() {
 			die(PleaseRedirect)
 		}
-		var readers []io.Reader
+		var readers []namedReader
 		for _, arg := range args {
 			f, err := os.Open(arg)
 			if err != nil {
 				die("failed to open %s: %s\n", arg, err)
 			}
 			defer f.Close()
-			readers = append(readers, f)
+			readers = append(readers, namedReader{name: arg, reader: f})
 		}
+
+		if mergeCompression == compressionNoneAlias {
+			mergeCompression = ""
+		}
+
 		opts := mergeOpts{
-			compression: mergeCompression,
-			chunkSize:   mergeChunkSize,
-			includeCRC:  mergeIncludeCRC,
-			chunked:     mergeChunked,
+			compression:            mergeCompression,
+			chunkSize:              mergeChunkSize,
+			includeCRC:             mergeIncludeCRC,
+			chunked:                mergeChunked,
+			allowDuplicateMetadata: mergeAllowDuplicateMetadata,
+			coalesceChannels:       coalesceChannels,
 		}
 		merger := newMCAPMerger(opts)
 		var writer io.Writer
@@ -277,7 +531,7 @@ var mergeCmd = &cobra.Command{
 		}
 		err := merger.mergeInputs(writer, readers)
 		if err != nil {
-			die(err.Error())
+			die("Merge failure: " + err.Error())
 		}
 	},
 }
@@ -318,5 +572,23 @@ func init() {
 		"",
 		true,
 		"chunk the output file",
+	)
+	mergeCmd.PersistentFlags().BoolVarP(
+		&mergeAllowDuplicateMetadata,
+		"allow-duplicate-metadata",
+		"",
+		false,
+		"Allow duplicate-named metadata records to be merged in the output",
+	)
+	mergeCmd.PersistentFlags().StringVarP(
+		&coalesceChannels,
+		"coalesce-channels",
+		"",
+		"auto",
+		`channel coalescing behavior (supported: auto, force, none).
+ - auto: Coalesce channels with matching topic, schema and metadata
+ - force: Same as auto but ignores metadata
+ - none: Do not coalesce channels
+`,
 	)
 }

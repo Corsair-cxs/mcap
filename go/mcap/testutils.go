@@ -9,7 +9,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func encodedUint16(x uint16) []byte {
@@ -94,19 +94,19 @@ func chunk(t *testing.T, compression CompressionFormat, includeCRC bool, records
 			t.Errorf("failed to create zstd writer: %s", err)
 		}
 		_, err = io.Copy(w, bytes.NewReader(data))
-		assert.Nil(t, err)
+		require.NoError(t, err)
 		w.Close()
 	case CompressionLZ4:
 		w := lz4.NewWriter(buf)
 		_, err := io.Copy(w, bytes.NewReader(data))
-		assert.Nil(t, err)
+		require.NoError(t, err)
 		w.Close()
 	case CompressionNone:
 		_, err := buf.Write(data)
-		assert.Nil(t, err)
+		require.NoError(t, err)
 	default:
 		_, err := buf.Write(data) // unrecognized compression
-		assert.Nil(t, err)
+		require.NoError(t, err)
 	}
 	compressionLen := len(compression)
 	compressedLen := buf.Len()
@@ -114,7 +114,7 @@ func chunk(t *testing.T, compression CompressionFormat, includeCRC bool, records
 	msglen := uint64(8 + 8 + 8 + 4 + 4 + compressionLen + 8 + compressedLen)
 	record := make([]byte, msglen+9)
 	offset, err := putByte(record, byte(OpChunk))
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	offset += putUint64(record[offset:], msglen)
 
 	offset += putUint64(record[offset:], 0)   // start
@@ -142,7 +142,15 @@ func record(op OpCode) []byte {
 }
 
 func attachment() []byte {
-	buf := make([]byte, 9)
+	recordLen := 9 + // opcode + record length
+		8 + // record time
+		8 + // create time
+		4 + // attachment name length
+		4 + // media type length
+		8 + // data size
+		4 // crc length
+	buf := make([]byte, recordLen)
 	buf[0] = byte(OpAttachment)
+	putUint64(buf[1:], uint64(recordLen-9))
 	return buf
 }

@@ -17,10 +17,10 @@ pip install mcap-ros2-support
 from mcap_ros2.reader import read_ros2_messages
 
 for msg in read_ros2_messages("my_data.mcap"):
-    print(f"{msg.topic}: f{msg.ros_msg}")
+    print(f"{msg.channel.topic}: f{msg.ros_msg}")
 ```
 
 ## Stay in touch
 
-Join our [Slack channel](https://foxglove.dev/join-slack) to ask questions,
+Join our [Slack channel](https://foxglove.dev/slack) to ask questions,
 share feedback, and stay up to date on what our team is working on.

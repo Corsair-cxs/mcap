@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.hpp"
+#include "visibility.hpp"
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -8,14 +9,16 @@
 #include <vector>
 
 // Forward declaration
+#ifndef MCAP_COMPRESSION_NO_ZSTD
 struct ZSTD_CCtx_s;
+#endif
 
 namespace mcap {
 
 /**
  * @brief Configuration options for McapWriter.
  */
-struct McapWriterOptions {
+struct MCAP_PUBLIC McapWriterOptions {
   /**
    * @brief Disable CRC calculations for Chunks.
    */
@@ -78,7 +81,7 @@ struct McapWriterOptions {
   bool forceCompression = false;
   /**
    * @brief The recording profile. See
-   * <https://github.com/foxglove/mcap/tree/main/docs/specification/profiles>
+   * https://mcap.dev/spec/registry#well-known-profiles
    * for more information on well-known profiles.
    */
   std::string profile;
@@ -106,7 +109,7 @@ struct McapWriterOptions {
 /**
  * @brief An abstract interface for writing MCAP data.
  */
-class IWritable {
+class MCAP_PUBLIC IWritable {
 public:
   bool crcEnabled = false;
 
@@ -151,7 +154,7 @@ private:
  * @brief Implements the IWritable interface used by McapWriter by wrapping a
  * FILE* pointer created by fopen().
  */
-class FileWriter final : public IWritable {
+class MCAP_PUBLIC FileWriter final : public IWritable {
 public:
   ~FileWriter() override;
 
@@ -170,7 +173,7 @@ private:
  * @brief Implements the IWritable interface used by McapWriter by wrapping a
  * std::ostream stream.
  */
-class StreamWriter final : public IWritable {
+class MCAP_PUBLIC StreamWriter final : public IWritable {
 public:
   StreamWriter(std::ostream& stream);
 
@@ -188,20 +191,20 @@ private:
  * in memory and written to disk as a single record, to support optimal
  * compression and calculating the final Chunk data size.
  */
-class IChunkWriter : public IWritable {
+class MCAP_PUBLIC IChunkWriter : public IWritable {
 public:
-  virtual ~IChunkWriter() = default;
+  virtual ~IChunkWriter() override = default;
 
   /**
    * @brief Called when the writer wants to close the current output Chunk.
    * After this call, `data()` and `size()` should return the data and size of
    * the compressed data.
    */
-  virtual void end() = 0;
+  virtual void end() override = 0;
   /**
    * @brief Returns the size in bytes of the uncompressed data.
    */
-  virtual uint64_t size() const = 0;
+  virtual uint64_t size() const override = 0;
   /**
    * @brief Returns the size in bytes of the compressed data. This will only be
    * called after `end()`.
@@ -235,7 +238,7 @@ protected:
  * @brief An in-memory IChunkWriter implementation backed by a
  * growable buffer.
  */
-class BufferWriter final : public IChunkWriter {
+class MCAP_PUBLIC BufferWriter final : public IChunkWriter {
 public:
   void handleWrite(const std::byte* data, uint64_t size) override;
   void end() override;
@@ -250,11 +253,12 @@ private:
   std::vector<std::byte> buffer_;
 };
 
+#ifndef MCAP_COMPRESSION_NO_LZ4
 /**
  * @brief An in-memory IChunkWriter implementation that holds data in a
  * temporary buffer before flushing to an LZ4-compressed buffer.
  */
-class LZ4Writer final : public IChunkWriter {
+class MCAP_PUBLIC LZ4Writer final : public IChunkWriter {
 public:
   LZ4Writer(CompressionLevel compressionLevel, uint64_t chunkSize);
 
@@ -272,12 +276,14 @@ private:
   std::vector<std::byte> compressedBuffer_;
   CompressionLevel compressionLevel_;
 };
+#endif
 
+#ifndef MCAP_COMPRESSION_NO_ZSTD
 /**
  * @brief An in-memory IChunkWriter implementation that holds data in a
  * temporary buffer before flushing to an ZStandard-compressed buffer.
  */
-class ZStdWriter final : public IChunkWriter {
+class MCAP_PUBLIC ZStdWriter final : public IChunkWriter {
 public:
   ZStdWriter(CompressionLevel compressionLevel, uint64_t chunkSize);
   ~ZStdWriter() override;
@@ -296,11 +302,12 @@ private:
   std::vector<std::byte> compressedBuffer_;
   ZSTD_CCtx_s* zstdContext_ = nullptr;
 };
+#endif
 
 /**
  * @brief Provides a write interface to an MCAP file.
  */
-class McapWriter final {
+class MCAP_PUBLIC McapWriter final {
 public:
   ~McapWriter();
 
@@ -382,10 +389,10 @@ public:
   /**
    * @brief Write a metadata record to the output stream.
    *
-   * @param metdata  Named group of key/value string pairs to add.
+   * @param metadata Named group of key/value string pairs to add.
    * @return A non-zero error code on failure.
    */
-  Status write(const Metadata& metdata);
+  Status write(const Metadata& metadata);
 
   /**
    * @brief Current MCAP file-level statistics. This is written as a Statistics
@@ -444,8 +451,12 @@ private:
   std::unique_ptr<FileWriter> fileOutput_;
   std::unique_ptr<StreamWriter> streamOutput_;
   std::unique_ptr<BufferWriter> uncompressedChunk_;
+#ifndef MCAP_COMPRESSION_NO_LZ4
   std::unique_ptr<LZ4Writer> lz4Chunk_;
+#endif
+#ifndef MCAP_COMPRESSION_NO_ZSTD
   std::unique_ptr<ZStdWriter> zstdChunk_;
+#endif
   std::vector<Schema> schemas_;
   std::vector<Channel> channels_;
   std::vector<AttachmentIndex> attachmentIndex_;
@@ -468,5 +479,5 @@ private:
 }  // namespace mcap
 
 #ifdef MCAP_IMPLEMENTATION
-#include "writer.inl"
+#  include "writer.inl"
 #endif

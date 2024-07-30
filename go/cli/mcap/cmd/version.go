@@ -10,11 +10,11 @@ import (
 var Version string
 var printLibraryVersion bool
 
-// versionCmd represents the version command
+// versionCmd represents the version command.
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Output version information",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(*cobra.Command, []string) {
 		if printLibraryVersion {
 			fmt.Println(mcap.Version)
 		} else {
@@ -24,6 +24,12 @@ var versionCmd = &cobra.Command{
 }
 
 func init() {
-	versionCmd.PersistentFlags().BoolVarP(&printLibraryVersion, "library", "l", false, "print MCAP library version instead of CLI version")
+	versionCmd.PersistentFlags().BoolVarP(
+		&printLibraryVersion,
+		"library",
+		"l",
+		false,
+		"print MCAP library version instead of CLI version",
+	)
 	rootCmd.AddCommand(versionCmd)
 }

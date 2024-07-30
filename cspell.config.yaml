@@ -14,6 +14,8 @@ ignorePaths:
   - bin
   - dist
   - yarn-error.log
+  - "*.bfbs"
+  - "*.csv"
   - "*.Dockerfile"
   - Dockerfile
   - "*.mcap"
@@ -23,42 +25,61 @@ ignorePaths:
   - package.xml
   - "*_pb2.py"
   - "*.pyc"
+  - "*.svg"
+  - "*.webp"
   - Pipfile*
   - mkdocs.yml
   - fathom.html
-  - vendor
+  - _vendor
+  - go
   - rust
+  - cpp/examples/protobuf/proto
 
 words:
+  - Anduril
   - bagfile
+  - bfbs
   - callerid
   - cbor
   - cmake
+  - colcon
   - conanfile
+  - conans
   - crc
   - crcs
   - datetime
   - deserialization
   - distro
+  - elems
   - flatbuffer
+  - flatbuffers
   - flatc
   - fwrite
   - gendeps
   - genpy
   - gentools
   - golangci
+  - infima
+  - inputfile
+  - intrinsics
   - jsonschema
   - kaitai
   - libmcap
+  - matplotlib
   - mcap
+  - msgdef
   - nanos
   - nanosec
   - noenv
+  - Norlab
   - nsec
   - nsecs
+  - numpy
+  - omgidl
   - parseable
   - pipenv
   - pointcloud
+  - pointclouds
   - proto
   - protobuf
   - protoc
@@ -66,7 +87,10 @@ words:
   - rosbag
   - rosmsg
   - rostime
+  - schemaless
   - serde
+  - sfixed
+  - srgb
   - stoull
   - struct
   - swiftformat
@@ -77,8 +101,12 @@ words:
   - unchunked
   - unindexed
   - velodyne
+  - waabi
+  - webp
+  - xcdr
   - zstandard
   - zstd
+  - zustand
 
 languageSettings:
   - languageId: "markdown"
@@ -117,7 +145,7 @@ overrides:
     ignoreRegExpList:
       - "0x[0-9a-f]+n?"
 
-  - filename: "(Pipfile|README.md|pyproject.toml)"
+  - filename: "(Pipfile|README.md|pyproject.toml|setup.cfg)"
     words:
       - pypi
       - pyright
@@ -126,6 +154,7 @@ overrides:
       - addopts
       - xfail
       - Pipfile
+      - pyyaml
 
   - filename: "python/**/*.rst"
     words:

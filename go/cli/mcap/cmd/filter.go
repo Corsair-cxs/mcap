@@ -18,8 +18,10 @@ type filterFlags struct {
 	output             string
 	includeTopics      []string
 	excludeTopics      []string
-	start              uint64
-	end                uint64
+	startSec           uint64
+	endSec             uint64
+	startNano          uint64
+	endNano            uint64
 	includeMetadata    bool
 	includeAttachments bool
 	outputCompression  string
@@ -39,23 +41,28 @@ type filterOpts struct {
 	chunkSize          int64
 }
 
-func buildFilterOptions(flags filterFlags) (*filterOpts, error) {
+func buildFilterOptions(flags *filterFlags) (*filterOpts, error) {
 	opts := &filterOpts{
 		output:             flags.output,
 		includeMetadata:    flags.includeMetadata,
 		includeAttachments: flags.includeAttachments,
 	}
-	opts.start = flags.start * 1e9
-	if flags.end == 0 {
+	opts.start = flags.startNano
+	if flags.startSec > 0 {
+		opts.start = flags.startSec * 1e9
+	}
+	opts.end = flags.endNano
+	if flags.endSec > 0 {
+		opts.end = flags.endSec * 1e9
+	}
+	if opts.end == 0 {
 		opts.end = math.MaxUint64
-	} else {
-		opts.end = flags.end * 1e9
+	}
+	if opts.end < opts.start {
+		return nil, errors.New("invalid time range query, end-time is before start-time")
 	}
 	if len(flags.includeTopics) > 0 && len(flags.excludeTopics) > 0 {
 		return nil, errors.New("can only use one of --include-topic-regex and --exclude-topic-regex")
-	}
-	if flags.end < flags.start {
-		return nil, errors.New("invalid time range query, end-time is before start-time")
 	}
 	opts.compressionFormat = mcap.CompressionNone
 	switch flags.outputCompression {
@@ -64,9 +71,13 @@ func buildFilterOptions(flags filterFlags) (*filterOpts, error) {
 	case "lz4":
 		opts.compressionFormat = mcap.CompressionLZ4
 	case "none":
+	case "":
 		opts.compressionFormat = mcap.CompressionNone
 	default:
-		return nil, fmt.Errorf("unrecognized compression format '%s': valid options are 'lz4', 'zstd', or 'none'", flags.outputCompression)
+		return nil, fmt.Errorf(
+			"unrecognized compression format '%s': valid options are 'lz4', 'zstd', or 'none'",
+			flags.outputCompression,
+		)
 	}
 
 	includeTopics, err := compileMatchers(flags.includeTopics)
@@ -97,12 +108,12 @@ func run(filterOptions *filterOpts, args []string) {
 			die("please supply a file. see --help for usage details.")
 		}
 	} else {
-		close, newReader, err := utils.GetReader(context.Background(), args[0])
+		closeFile, newReader, err := utils.GetReader(context.Background(), args[0])
 		if err != nil {
 			die("failed to open source for reading: %s", err)
 		}
 		defer func() {
-			if closeErr := close(); closeErr != nil {
+			if closeErr := closeFile(); closeErr != nil {
 				die("error closing read source: %s", closeErr)
 			}
 		}()
@@ -130,26 +141,26 @@ func run(filterOptions *filterOpts, args []string) {
 
 	err := filter(reader, writer, filterOptions)
 	if err != nil {
-		die(error.Error(err))
+		die("failed to filter: %s", err)
 	}
 }
 
 func compileMatchers(regexStrings []string) ([]regexp.Regexp, error) {
-	var matchers []regexp.Regexp
+	matchers := make([]regexp.Regexp, len(regexStrings))
 
-	for _, regexString := range regexStrings {
+	for i, regexString := range regexStrings {
 		// auto-surround with ^$ if not specified.
 		if regexString[:1] != "^" {
 			regexString = "^" + regexString
 		}
 		if regexString[len(regexString)-1:] != "$" {
-			regexString = regexString + "$"
+			regexString += "$"
 		}
 		regex, err := regexp.Compile(regexString)
 		if err != nil {
 			return nil, err
 		}
-		matchers = append(matchers, *regex)
+		matchers[i] = *regex
 	}
 	return matchers, nil
 }
@@ -168,10 +179,6 @@ func filter(
 	w io.Writer,
 	opts *filterOpts,
 ) error {
-	lexer, err := mcap.NewLexer(r, &mcap.LexerOptions{ValidateCRC: true, EmitInvalidChunks: opts.recover})
-	if err != nil {
-		return err
-	}
 	mcapWriter, err := mcap.NewWriter(w, &mcap.WriterOptions{
 		Compression: opts.compressionFormat,
 		Chunked:     true,
@@ -183,6 +190,38 @@ func filter(
 
 	var numMessages, numAttachments, numMetadata uint64
 
+	lexer, err := mcap.NewLexer(r, &mcap.LexerOptions{
+		ValidateChunkCRCs: true,
+		EmitInvalidChunks: opts.recover,
+		AttachmentCallback: func(ar *mcap.AttachmentReader) error {
+			if !opts.includeAttachments {
+				return nil
+			}
+			if ar.LogTime < opts.start {
+				return nil
+			}
+			if ar.LogTime >= opts.end {
+				return nil
+			}
+			err = mcapWriter.WriteAttachment(&mcap.Attachment{
+				LogTime:    ar.LogTime,
+				CreateTime: ar.CreateTime,
+				Name:       ar.Name,
+				MediaType:  ar.MediaType,
+				DataSize:   ar.DataSize,
+				Data:       ar.Data(),
+			})
+			if err != nil {
+				return err
+			}
+			numAttachments++
+			return nil
+		},
+	})
+	if err != nil {
+		return err
+	}
+
 	defer func() {
 		err := mcapWriter.Close()
 		if err != nil {
@@ -190,7 +229,12 @@ func filter(
 			return
 		}
 		if opts.recover {
-			fmt.Printf("Recovered %d messages, %d attachments, and %d metadata records.\n", numMessages, numAttachments, numMetadata)
+			fmt.Printf(
+				"Recovered %d messages, %d attachments, and %d metadata records.\n",
+				numMessages,
+				numAttachments,
+				numMetadata,
+			)
 		}
 	}()
 
@@ -204,13 +248,16 @@ func filter(
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			if opts.recover && errors.Is(err, io.ErrUnexpectedEOF) {
-				fmt.Println("Input file was truncated.")
-				return nil
-			}
-			if opts.recover && token == mcap.TokenInvalidChunk {
-				fmt.Printf("Invalid chunk encountered, skipping: %s\n", err)
-				continue
+			if opts.recover {
+				var expected *mcap.ErrTruncatedRecord
+				if errors.As(err, &expected) {
+					fmt.Println(expected.Error())
+					return nil
+				}
+				if token == mcap.TokenInvalidChunk {
+					fmt.Printf("Invalid chunk encountered, skipping: %s\n", err)
+					continue
+				}
 			}
 			return err
 		}
@@ -223,7 +270,7 @@ func filter(
 			if err != nil {
 				return err
 			}
-			if err = mcapWriter.WriteHeader(header); err != nil {
+			if err := mcapWriter.WriteHeader(header); err != nil {
 				return err
 			}
 		case mcap.TokenSchema:
@@ -237,16 +284,27 @@ func filter(
 			if err != nil {
 				return err
 			}
-			for _, matcher := range opts.includeTopics {
+			// if any topics match an includeTopic, add it.
+			for i := range opts.includeTopics {
+				matcher := opts.includeTopics[i]
 				if matcher.MatchString(channel.Topic) {
 					channels[channel.ID] = markableChannel{channel, false}
 				}
 			}
-			for _, matcher := range opts.excludeTopics {
-				if !matcher.MatchString(channel.Topic) {
+			// if a topic does not match any excludeTopic, add it.
+			if len(opts.excludeTopics) != 0 {
+				shouldInclude := true
+				for i := range opts.excludeTopics {
+					matcher := opts.excludeTopics[i]
+					if matcher.MatchString(channel.Topic) {
+						shouldInclude = false
+					}
+				}
+				if shouldInclude {
 					channels[channel.ID] = markableChannel{channel, false}
 				}
 			}
+			// if neither exclude or include topics are specified, add all channels.
 			if len(opts.includeTopics) == 0 && len(opts.excludeTopics) == 0 {
 				channels[channel.ID] = markableChannel{channel, false}
 			}
@@ -266,43 +324,27 @@ func filter(
 				continue
 			}
 			if !channel.written {
-				schema, ok := schemas[channel.SchemaID]
-				if !ok {
-					return fmt.Errorf("encountered channel with topic %s with unknown schema ID %d", channel.Topic, channel.SchemaID)
-				}
-				if !schema.written {
-					if err = mcapWriter.WriteSchema(schema.Schema); err != nil {
-						return err
+				if channel.SchemaID != 0 {
+					schema, ok := schemas[channel.SchemaID]
+					if !ok {
+						return fmt.Errorf("encountered channel with topic %s with unknown schema ID %d", channel.Topic, channel.SchemaID)
 					}
-					schema.written = true
+					if !schema.written {
+						if err := mcapWriter.WriteSchema(schema.Schema); err != nil {
+							return err
+						}
+						schemas[channel.SchemaID] = markableSchema{schema.Schema, true}
+					}
 				}
-				if err = mcapWriter.WriteChannel(channel.Channel); err != nil {
+				if err := mcapWriter.WriteChannel(channel.Channel); err != nil {
 					return err
 				}
-				channel.written = true
+				channels[message.ChannelID] = markableChannel{channel.Channel, true}
 			}
-			if err = mcapWriter.WriteMessage(message); err != nil {
+			if err := mcapWriter.WriteMessage(message); err != nil {
 				return err
 			}
 			numMessages++
-		case mcap.TokenAttachment:
-			if !opts.includeAttachments {
-				continue
-			}
-			attachment, err := mcap.ParseAttachment(data)
-			if err != nil {
-				return err
-			}
-			if attachment.LogTime < opts.start {
-				continue
-			}
-			if attachment.LogTime >= opts.end {
-				continue
-			}
-			if err = mcapWriter.WriteAttachment(attachment); err != nil {
-				return err
-			}
-			numAttachments++
 		case mcap.TokenMetadata:
 			if !opts.includeMetadata {
 				continue
@@ -311,7 +353,7 @@ func filter(
 			if err != nil {
 				return err
 			}
-			if err = mcapWriter.WriteMetadata(metadata); err != nil {
+			if err := mcapWriter.WriteMetadata(metadata); err != nil {
 				return err
 			}
 			numMetadata++
@@ -338,21 +380,69 @@ usage:
   mcap filter in.mcap -o out.mcap -y /diagnostics -y /tf -y /camera_(front|back)`,
 		}
 		output := filterCmd.PersistentFlags().StringP("output", "o", "", "output filename")
-		includeTopics := filterCmd.PersistentFlags().StringArrayP("include-topic-regex", "y", []string{}, "messages with topic names matching this regex will be included, can be supplied multiple times")
-		excludeTopics := filterCmd.PersistentFlags().StringArrayP("exclude-topic-regex", "n", []string{}, "messages with topic names matching this regex will be excluded, can be supplied multiple times")
-		start := filterCmd.PersistentFlags().Uint64P("start-secs", "s", 0, "messages with log times after or equal to this timestamp will be included.")
-		end := filterCmd.PersistentFlags().Uint64P("end-secs", "e", 0, "messages with log times before timestamp will be included.")
+		includeTopics := filterCmd.PersistentFlags().StringArrayP(
+			"include-topic-regex",
+			"y",
+			[]string{},
+			"messages with topic names matching this regex will be included, can be supplied multiple times",
+		)
+		excludeTopics := filterCmd.PersistentFlags().StringArrayP(
+			"exclude-topic-regex",
+			"n",
+			[]string{},
+			"messages with topic names matching this regex will be excluded, can be supplied multiple times",
+		)
+		startSec := filterCmd.PersistentFlags().Uint64P(
+			"start-secs",
+			"s",
+			0,
+			"messages with log times after or equal to this timestamp will be included.",
+		)
+		endSec := filterCmd.PersistentFlags().Uint64P(
+			"end-secs",
+			"e",
+			0,
+			"messages with log times before timestamp will be included.",
+		)
+		startNano := filterCmd.PersistentFlags().Uint64P(
+			"start-nsecs",
+			"S",
+			0,
+			"messages with log times after or equal to this nanosecond-precision timestamp will be included.",
+		)
+		endNano := filterCmd.PersistentFlags().Uint64P(
+			"end-nsecs",
+			"E",
+			0,
+			"messages with log times before nanosecond-precision timestamp will be included.",
+		)
+		filterCmd.MarkFlagsMutuallyExclusive("start-secs", "start-nsecs")
+		filterCmd.MarkFlagsMutuallyExclusive("end-secs", "end-nsecs")
 		chunkSize := filterCmd.PersistentFlags().Int64P("chunk-size", "", 4*1024*1024, "chunk size of output file")
-		includeMetadata := filterCmd.PersistentFlags().Bool("include-metadata", false, "whether to include metadata in the output bag")
-		includeAttachments := filterCmd.PersistentFlags().Bool("include-attachments", false, "whether to include attachments in the output mcap")
-		outputCompression := filterCmd.PersistentFlags().String("output-compression", "zstd", "compression algorithm to use on output file")
-		filterCmd.Run = func(cmd *cobra.Command, args []string) {
-			filterOptions, err := buildFilterOptions(filterFlags{
+		includeMetadata := filterCmd.PersistentFlags().Bool(
+			"include-metadata",
+			false,
+			"whether to include metadata in the output bag",
+		)
+		includeAttachments := filterCmd.PersistentFlags().Bool(
+			"include-attachments",
+			false,
+			"whether to include attachments in the output mcap",
+		)
+		outputCompression := filterCmd.PersistentFlags().String(
+			"output-compression",
+			"zstd",
+			"compression algorithm to use on output file",
+		)
+		filterCmd.Run = func(_ *cobra.Command, args []string) {
+			filterOptions, err := buildFilterOptions(&filterFlags{
 				output:             *output,
 				includeTopics:      *includeTopics,
 				excludeTopics:      *excludeTopics,
-				start:              *start,
-				end:                *end,
+				startSec:           *startSec,
+				endSec:             *endSec,
+				startNano:          *startNano,
+				endNano:            *endNano,
 				chunkSize:          *chunkSize,
 				includeMetadata:    *includeMetadata,
 				includeAttachments: *includeAttachments,
@@ -377,9 +467,13 @@ usage:
 		}
 		output := recoverCmd.PersistentFlags().StringP("output", "o", "", "output filename")
 		chunkSize := recoverCmd.PersistentFlags().Int64P("chunk-size", "", 4*1024*1024, "chunk size of output file")
-		compression := recoverCmd.PersistentFlags().String("compression", "zstd", "compression algorithm to use on output file")
-		recoverCmd.Run = func(cmd *cobra.Command, args []string) {
-			filterOptions, err := buildFilterOptions(filterFlags{
+		compression := recoverCmd.PersistentFlags().String(
+			"compression",
+			"zstd",
+			"compression algorithm to use on output file",
+		)
+		recoverCmd.Run = func(_ *cobra.Command, args []string) {
+			filterOptions, err := buildFilterOptions(&filterFlags{
 				output:             *output,
 				chunkSize:          *chunkSize,
 				outputCompression:  *compression,
@@ -398,7 +492,7 @@ usage:
 	{
 		var compressCmd = &cobra.Command{
 			Use:   "compress [file]",
-			Short: "Compress data in an MCAP file",
+			Short: "Create a compressed copy of an MCAP file",
 			Long: `This subcommand copies data in an MCAP file to a new file, compressing the output.
 
 usage:
@@ -406,9 +500,13 @@ usage:
 		}
 		output := compressCmd.PersistentFlags().StringP("output", "o", "", "output filename")
 		chunkSize := compressCmd.PersistentFlags().Int64P("chunk-size", "", 4*1024*1024, "chunk size of output file")
-		compression := compressCmd.PersistentFlags().String("compression", "zstd", "compression algorithm to use on output file")
-		compressCmd.Run = func(cmd *cobra.Command, args []string) {
-			filterOptions, err := buildFilterOptions(filterFlags{
+		compression := compressCmd.PersistentFlags().String(
+			"compression",
+			"zstd",
+			"compression algorithm to use on output file",
+		)
+		compressCmd.Run = func(_ *cobra.Command, args []string) {
+			filterOptions, err := buildFilterOptions(&filterFlags{
 				output:             *output,
 				chunkSize:          *chunkSize,
 				outputCompression:  *compression,
@@ -421,5 +519,32 @@ usage:
 			run(filterOptions, args)
 		}
 		rootCmd.AddCommand(compressCmd)
+	}
+
+	{
+		var decompressCmd = &cobra.Command{
+			Use:   "decompress [file]",
+			Short: "Create an uncompressed copy of an MCAP file",
+			Long: `This subcommand copies data in an MCAP file to a new file, decompressing the output.
+
+usage:
+  mcap decompress in.mcap -o out.mcap`,
+		}
+		output := decompressCmd.PersistentFlags().StringP("output", "o", "", "output filename")
+		chunkSize := decompressCmd.PersistentFlags().Int64P("chunk-size", "", 4*1024*1024, "chunk size of output file")
+		decompressCmd.Run = func(_ *cobra.Command, args []string) {
+			filterOptions, err := buildFilterOptions(&filterFlags{
+				output:             *output,
+				chunkSize:          *chunkSize,
+				outputCompression:  "none",
+				includeMetadata:    true,
+				includeAttachments: true,
+			})
+			if err != nil {
+				die("configuration error: %s", err)
+			}
+			run(filterOptions, args)
+		}
+		rootCmd.AddCommand(decompressCmd)
 	}
 }

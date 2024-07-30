@@ -8,6 +8,7 @@ import (
 
 	"github.com/foxglove/mcap/go/mcap"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func writeFilterTestInput(t *testing.T, w io.Writer) {
@@ -16,50 +17,115 @@ func writeFilterTestInput(t *testing.T, w io.Writer) {
 		Chunked:   true,
 		ChunkSize: 10,
 	})
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
-	assert.Nil(t, writer.WriteHeader(&mcap.Header{}))
-	assert.Nil(t, writer.WriteSchema(&mcap.Schema{
+	require.NoError(t, writer.WriteHeader(&mcap.Header{}))
+	require.NoError(t, writer.WriteSchema(&mcap.Schema{
 		ID: 1,
 	}))
-	assert.Nil(t, writer.WriteChannel(&mcap.Channel{
+	require.NoError(t, writer.WriteChannel(&mcap.Channel{
 		ID:       1,
 		SchemaID: 1,
 		Topic:    "camera_a",
 	}))
-	assert.Nil(t, writer.WriteChannel(&mcap.Channel{
+	require.NoError(t, writer.WriteChannel(&mcap.Channel{
 		ID:       2,
 		SchemaID: 1,
 		Topic:    "camera_b",
 	}))
-	assert.Nil(t, writer.WriteChannel(&mcap.Channel{
+	require.NoError(t, writer.WriteChannel(&mcap.Channel{
 		ID:       3,
-		SchemaID: 1,
+		SchemaID: 0,
 		Topic:    "radar_a",
 	}))
 	for i := 0; i < 100; i++ {
-		assert.Nil(t, writer.WriteMessage(&mcap.Message{
+		require.NoError(t, writer.WriteMessage(&mcap.Message{
 			ChannelID: 1,
 			LogTime:   uint64(i),
 		}))
-		assert.Nil(t, writer.WriteMessage(&mcap.Message{
+		require.NoError(t, writer.WriteMessage(&mcap.Message{
 			ChannelID: 2,
 			LogTime:   uint64(i),
 		}))
-		assert.Nil(t, writer.WriteMessage(&mcap.Message{
+		require.NoError(t, writer.WriteMessage(&mcap.Message{
 			ChannelID: 3,
 			LogTime:   uint64(i),
 		}))
 	}
-	assert.Nil(t, writer.WriteAttachment(&mcap.Attachment{
+	require.NoError(t, writer.WriteAttachment(&mcap.Attachment{
 		LogTime: 50,
 		Name:    "attachment",
+		Data:    bytes.NewReader(nil),
 	}))
-	assert.Nil(t, writer.WriteMetadata(&mcap.Metadata{
+	require.NoError(t, writer.WriteMetadata(&mcap.Metadata{
 		Name: "metadata",
 	}))
-	assert.Nil(t, writer.Close())
+	require.NoError(t, writer.Close())
 }
+func TestPassthrough(t *testing.T) {
+	opts := &filterOpts{
+		compressionFormat:  mcap.CompressionLZ4,
+		start:              0,
+		end:                1000,
+		includeAttachments: true,
+		includeMetadata:    true,
+	}
+
+	writeBuf := bytes.Buffer{}
+	readBuf := bytes.Buffer{}
+
+	writeFilterTestInput(t, &readBuf)
+	require.NoError(t, filter(&readBuf, &writeBuf, opts))
+	attachmentCounter := 0
+	metadataCounter := 0
+	schemaCounter := 0
+	messageCounter := map[uint16]int{
+		1: 0,
+		2: 0,
+		3: 0,
+	}
+	channelCounter := map[uint16]int{
+		1: 0,
+		2: 0,
+		3: 0,
+	}
+	lexer, err := mcap.NewLexer(&writeBuf, &mcap.LexerOptions{
+		AttachmentCallback: func(*mcap.AttachmentReader) error {
+			attachmentCounter++
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	defer lexer.Close()
+	for {
+		token, record, err := lexer.Next(nil)
+		if err != nil {
+			require.ErrorIs(t, err, io.EOF)
+			break
+		}
+		switch token {
+		case mcap.TokenMessage:
+			message, err := mcap.ParseMessage(record)
+			require.NoError(t, err)
+			messageCounter[message.ChannelID]++
+		case mcap.TokenChannel:
+			channel, err := mcap.ParseChannel(record)
+			require.NoError(t, err)
+			channelCounter[channel.ID]++
+		case mcap.TokenSchema:
+			schemaCounter++
+		case mcap.TokenMetadata:
+			metadataCounter++
+		}
+	}
+	assert.Equal(t, 1, attachmentCounter)
+	assert.Equal(t, 1, metadataCounter)
+	assert.InDeltaMapValues(t, map[uint16]int{1: 100, 2: 100, 3: 100}, messageCounter, 0.0)
+	// schemas and channels should be duplicated once into the summary section
+	assert.Equal(t, 2, schemaCounter)
+	assert.InDeltaMapValues(t, map[uint16]int{1: 2, 2: 2, 3: 2}, channelCounter, 0.0)
+}
+
 func TestFiltering(t *testing.T) {
 	cases := []struct {
 		name                    string
@@ -80,6 +146,23 @@ func TestFiltering(t *testing.T) {
 				1: 100,
 				2: 100,
 				3: 0,
+			},
+		},
+		{
+			name: "double exclusive topic filtering",
+			opts: &filterOpts{
+				compressionFormat: mcap.CompressionLZ4,
+				start:             0,
+				end:               1000,
+				excludeTopics: []regexp.Regexp{
+					*regexp.MustCompile("camera_a"),
+					*regexp.MustCompile("camera_b"),
+				},
+			},
+			expectedMessageCount: map[uint16]int{
+				1: 0,
+				2: 0,
+				3: 100,
 			},
 		},
 		{
@@ -136,30 +219,33 @@ func TestFiltering(t *testing.T) {
 			readBuf := bytes.Buffer{}
 
 			writeFilterTestInput(t, &readBuf)
-			assert.Nil(t, filter(&readBuf, &writeBuf, c.opts))
-
-			lexer, err := mcap.NewLexer(&writeBuf)
-			assert.Nil(t, err)
+			require.NoError(t, filter(&readBuf, &writeBuf, c.opts))
+			attachmentCounter := 0
+			metadataCounter := 0
+			lexer, err := mcap.NewLexer(&writeBuf, &mcap.LexerOptions{
+				AttachmentCallback: func(*mcap.AttachmentReader) error {
+					attachmentCounter++
+					return nil
+				},
+			})
+			require.NoError(t, err)
+			defer lexer.Close()
 			messageCounter := map[uint16]int{
 				1: 0,
 				2: 0,
 				3: 0,
 			}
-			attachmentCounter := 0
-			metadataCounter := 0
 			for {
 				token, record, err := lexer.Next(nil)
 				if err != nil {
-					assert.ErrorIs(t, err, io.EOF)
+					require.ErrorIs(t, err, io.EOF)
 					break
 				}
 				switch token {
 				case mcap.TokenMessage:
 					message, err := mcap.ParseMessage(record)
-					assert.Nil(t, err)
+					require.NoError(t, err)
 					messageCounter[message.ChannelID]++
-				case mcap.TokenAttachment:
-					attachmentCounter++
 				case mcap.TokenMetadata:
 					metadataCounter++
 				}
@@ -178,15 +264,13 @@ func TestRecover(t *testing.T) {
 		writeFilterTestInput(t, &readBuf)
 		readBuf.Truncate(readBuf.Len() / 2)
 
-		assert.Nil(t, filter(&readBuf, &writeBuf, &filterOpts{
+		require.NoError(t, filter(&readBuf, &writeBuf, &filterOpts{
 			end:                1000,
 			recover:            true,
 			includeAttachments: true,
 			includeMetadata:    true,
 		}))
 
-		lexer, err := mcap.NewLexer(&writeBuf)
-		assert.Nil(t, err)
 		messageCounter := map[uint16]int{
 			1: 0,
 			2: 0,
@@ -194,19 +278,25 @@ func TestRecover(t *testing.T) {
 		}
 		attachmentCounter := 0
 		metadataCounter := 0
+		lexer, err := mcap.NewLexer(&writeBuf, &mcap.LexerOptions{
+			AttachmentCallback: func(*mcap.AttachmentReader) error {
+				attachmentCounter++
+				return nil
+			},
+		})
+		require.NoError(t, err)
+		defer lexer.Close()
 		for {
 			token, record, err := lexer.Next(nil)
 			if err != nil {
-				assert.ErrorIs(t, err, io.EOF)
+				require.ErrorIs(t, err, io.EOF)
 				break
 			}
 			switch token {
 			case mcap.TokenMessage:
 				message, err := mcap.ParseMessage(record)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 				messageCounter[message.ChannelID]++
-			case mcap.TokenAttachment:
-				attachmentCounter++
 			case mcap.TokenMetadata:
 				metadataCounter++
 			}
@@ -214,9 +304,9 @@ func TestRecover(t *testing.T) {
 		assert.Equal(t, 0, attachmentCounter)
 		assert.Equal(t, 0, metadataCounter)
 		assert.InDeltaMapValues(t, map[uint16]int{
-			1: 87,
-			2: 87,
-			3: 87,
+			1: 88,
+			2: 88,
+			3: 88,
 		}, messageCounter, 0.0)
 	})
 
@@ -226,15 +316,12 @@ func TestRecover(t *testing.T) {
 		writeFilterTestInput(t, &readBuf)
 		readBuf.Bytes()[0x12b] = 1 // overwrite crc
 
-		assert.Nil(t, filter(&readBuf, &writeBuf, &filterOpts{
+		require.NoError(t, filter(&readBuf, &writeBuf, &filterOpts{
 			end:                1000,
 			recover:            true,
 			includeAttachments: true,
 			includeMetadata:    true,
 		}))
-
-		lexer, err := mcap.NewLexer(&writeBuf)
-		assert.Nil(t, err)
 		messageCounter := map[uint16]int{
 			1: 0,
 			2: 0,
@@ -242,19 +329,24 @@ func TestRecover(t *testing.T) {
 		}
 		attachmentCounter := 0
 		metadataCounter := 0
+		lexer, err := mcap.NewLexer(&writeBuf, &mcap.LexerOptions{
+			AttachmentCallback: func(_ *mcap.AttachmentReader) error {
+				attachmentCounter++
+				return nil
+			},
+		})
+		require.NoError(t, err)
 		for {
 			token, record, err := lexer.Next(nil)
 			if err != nil {
-				assert.ErrorIs(t, err, io.EOF)
+				require.ErrorIs(t, err, io.EOF)
 				break
 			}
 			switch token {
 			case mcap.TokenMessage:
 				message, err := mcap.ParseMessage(record)
-				assert.Nil(t, err)
+				require.NoError(t, err)
 				messageCounter[message.ChannelID]++
-			case mcap.TokenAttachment:
-				attachmentCounter++
 			case mcap.TokenMetadata:
 				metadataCounter++
 			}
@@ -267,4 +359,12 @@ func TestRecover(t *testing.T) {
 			3: 100,
 		}, messageCounter, 0.0)
 	})
+}
+
+func TestCompileMatchers(t *testing.T) {
+	matchers, err := compileMatchers([]string{"camera.*", "lights.*"})
+	require.NoError(t, err)
+	assert.Len(t, matchers, 2)
+	assert.True(t, matchers[0].MatchString("camera"))
+	assert.True(t, matchers[1].MatchString("lights"))
 }

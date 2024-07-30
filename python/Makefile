@@ -24,6 +24,7 @@ examples: pipenv
 	pipenv run python examples/raw/writer.py example_mcaps/raw.mcap
 	pipenv run python examples/raw/reader.py example_mcaps/raw.mcap
 	cd examples/protobuf && pipenv run python writer.py $(CURDIR)/example_mcaps/protobuf.mcap
+	cd examples/protobuf && pipenv run python image_example.py $(CURDIR)/example_mcaps/image.mcap
 	cd examples/protobuf && pipenv run python point_cloud_example.py $(CURDIR)/example_mcaps/point_cloud.mcap
 	cd examples/protobuf && pipenv run python reader.py $(CURDIR)/example_mcaps/protobuf.mcap
 	cd examples/protobuf && pipenv run python reader.py $(CURDIR)/example_mcaps/point_cloud.mcap
@@ -40,8 +41,9 @@ lint: pipenv
 	pipenv run python -m flake8
 	pipenv run black --check --diff --color mcap
 	pipenv run black --check --diff --color mcap-protobuf-support
-	pipenv run black --check --diff --color --extend-exclude="vendor" mcap-ros1-support
-	pipenv run black --check --diff --color --extend-exclude="vendor" mcap-ros2-support
+	pipenv run black --check --diff --color --extend-exclude="_vendor" mcap-ros1-support
+	pipenv run black --check --diff --color --extend-exclude="_vendor" mcap-ros2-support
+	pipenv run isort .
 	cd mcap && pipenv run pyright
 	cd mcap-protobuf-support && pipenv run pyright mcap_protobuf
 	cd mcap-ros1-support && pipenv run pyright mcap_ros1
@@ -51,8 +53,8 @@ lint: pipenv
 docs: pipenv
 	pipenv run sphinx-apidoc --separate --tocfile index --output-dir docs/mcap-apidoc mcap/mcap
 	pipenv run sphinx-apidoc --separate --tocfile index --output-dir docs/mcap-protobuf-apidoc mcap-protobuf-support/mcap_protobuf
-	pipenv run sphinx-apidoc --separate --tocfile index --output-dir docs/mcap-ros1-apidoc mcap-ros1-support/mcap_ros1 mcap-ros1-support/mcap_ros1/vendor
-	pipenv run sphinx-apidoc --separate --tocfile index --output-dir docs/mcap-ros2-apidoc mcap-ros2-support/mcap_ros2 mcap-ros2-support/mcap_ros2/vendor
+	pipenv run sphinx-apidoc --separate --tocfile index --output-dir docs/mcap-ros1-apidoc mcap-ros1-support/mcap_ros1 mcap-ros1-support/mcap_ros1/_vendor
+	pipenv run sphinx-apidoc --separate --tocfile index --output-dir docs/mcap-ros2-apidoc mcap-ros2-support/mcap_ros2 mcap-ros2-support/mcap_ros2/_vendor
 	pipenv run sphinx-build -W --keep-going docs ../__docs__/python
 	echo "Preview: file://$(abspath ../__docs__/python/index.html)"
 

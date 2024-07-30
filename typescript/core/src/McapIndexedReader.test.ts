@@ -49,6 +49,42 @@ function makeReadable(data: Uint8Array) {
   };
 }
 
+function writeChunkWithMessageIndexes(
+  builder: McapRecordBuilder,
+  chunk: ChunkBuilder,
+): TypedMcapRecords["ChunkIndex"] {
+  const chunkStartOffset = BigInt(builder.length);
+  const chunkLength = builder.writeChunk({
+    messageStartTime: chunk.messageStartTime,
+    messageEndTime: chunk.messageEndTime,
+    uncompressedSize: BigInt(chunk.buffer.length),
+    uncompressedCrc: 0,
+    compression: "",
+    records: chunk.buffer,
+  });
+
+  const messageIndexStart = BigInt(builder.length);
+  let messageIndexLength = 0n;
+  const chunkMessageIndexOffsets = new Map<number, bigint>();
+  for (const messageIndex of chunk.indices) {
+    chunkMessageIndexOffsets.set(messageIndex.channelId, messageIndexStart + messageIndexLength);
+    messageIndexLength += builder.writeMessageIndex(messageIndex);
+  }
+
+  return {
+    type: "ChunkIndex",
+    messageStartTime: chunk.messageStartTime,
+    messageEndTime: chunk.messageEndTime,
+    chunkStartOffset,
+    chunkLength,
+    messageIndexOffsets: chunkMessageIndexOffsets,
+    messageIndexLength,
+    compression: "",
+    compressedSize: BigInt(chunk.buffer.byteLength),
+    uncompressedSize: BigInt(chunk.buffer.byteLength),
+  };
+}
+
 describe("McapIndexedReader", () => {
   it("rejects files that are too small", async () => {
     await expect(
@@ -57,8 +93,8 @@ describe("McapIndexedReader", () => {
           new Uint8Array([
             ...MCAP_MAGIC,
             ...record(Opcode.FOOTER, [
-              ...uint64LE(0n), // summary offset
-              ...uint64LE(0n), // summary start offset
+              ...uint64LE(0n), // summary start
+              ...uint64LE(0n), // summary offset start
               ...uint32LE(0), // summary crc
             ]),
             ...MCAP_MAGIC,
@@ -92,8 +128,8 @@ describe("McapIndexedReader", () => {
           ...string(""), // library
         ]),
         ...record(Opcode.FOOTER, [
-          ...uint64LE(0n), // summary offset
-          ...uint64LE(0n), // summary start offset
+          ...uint64LE(0n), // summary start
+          ...uint64LE(0n), // summary offset start
           ...uint32LE(0), // summary crc
         ]),
         ...MCAP_MAGIC,
@@ -111,8 +147,8 @@ describe("McapIndexedReader", () => {
           ...string("lib"), // library
         ]),
         ...record(Opcode.FOOTER, [
-          ...uint64LE(0n), // summary offset
-          ...uint64LE(0n), // summary start offset
+          ...uint64LE(0n), // summary start
+          ...uint64LE(0n), // summary offset start
           ...uint32LE(0), // summary crc
         ]),
         ...MCAP_MAGIC,
@@ -130,6 +166,7 @@ describe("McapIndexedReader", () => {
         ...string(""), // profile
         ...string(""), // library
       ]),
+      ...record(Opcode.DATA_END, [...uint32LE(0)]),
     ];
     const summaryStart = data.length;
 
@@ -142,15 +179,15 @@ describe("McapIndexedReader", () => {
 
     data.push(
       ...record(Opcode.FOOTER, [
-        ...uint64LE(BigInt(summaryStart)), // summary offset
-        ...uint64LE(0n), // summary start offset
+        ...uint64LE(BigInt(summaryStart)), // summary start
+        ...uint64LE(0n), // summary offset start
         ...uint32LE(crc32(new Uint8Array([42]))), // summary crc
       ]),
       ...MCAP_MAGIC,
     );
     const readable = makeReadable(new Uint8Array(data));
     await expect(McapIndexedReader.Initialize({ readable })).rejects.toThrow(
-      "Incorrect summary CRC 491514153 (expected 163128923)",
+      "Incorrect summary CRC 1656343536 (expected 163128923)",
     );
   });
 
@@ -161,6 +198,7 @@ describe("McapIndexedReader", () => {
         ...string(""), // profile
         ...string(""), // library
       ]),
+      ...record(Opcode.DATA_END, [...uint32LE(0)]),
     ];
     const summaryStart = data.length;
     data.push(
@@ -178,8 +216,8 @@ describe("McapIndexedReader", () => {
         ...keyValues(string, string, [["foo", "bar"]]), // user data
       ]),
       ...record(Opcode.FOOTER, [
-        ...uint64LE(BigInt(summaryStart)), // summary offset
-        ...uint64LE(0n), // summary start offset
+        ...uint64LE(BigInt(summaryStart)), // summary start
+        ...uint64LE(0n), // summary offset start
         ...uint32LE(crc32(new Uint8Array(0))), // summary crc
       ]),
       ...MCAP_MAGIC,
@@ -324,6 +362,7 @@ describe("McapIndexedReader", () => {
           ]),
         );
         const messageIndexLength = BigInt(data.length) - messageIndexOffset;
+        data.push(...record(Opcode.DATA_END, [...uint32LE(0)]));
         const summaryStart = data.length;
         data.push(
           ...channel,
@@ -339,8 +378,8 @@ describe("McapIndexedReader", () => {
             ...uint64LE(BigInt(chunkContents.length)), // uncompressed size
           ]),
           ...record(Opcode.FOOTER, [
-            ...uint64LE(BigInt(summaryStart)), // summary offset
-            ...uint64LE(0n), // summary start offset
+            ...uint64LE(BigInt(summaryStart)), // summary start
+            ...uint64LE(0n), // summary offset start
             ...uint32LE(crc32(new Uint8Array(0))), // summary crc
           ]),
           ...MCAP_MAGIC,
@@ -484,46 +523,10 @@ describe("McapIndexedReader", () => {
     builder.writeHeader({ profile: "", library: "" });
 
     const chunkIndexes: TypedMcapRecords["ChunkIndex"][] = [];
-    function writeChunk(chunk: ChunkBuilder) {
-      const chunkStartOffset = BigInt(builder.length);
-      const chunkLength = builder.writeChunk({
-        messageStartTime: chunk.messageStartTime,
-        messageEndTime: chunk.messageEndTime,
-        uncompressedSize: BigInt(chunk.buffer.length),
-        uncompressedCrc: 0,
-        compression: "",
-        records: chunk.buffer,
-      });
-
-      const messageIndexStart = BigInt(builder.length);
-      let messageIndexLength = 0n;
-      const chunkMessageIndexOffsets = new Map<number, bigint>();
-      for (const messageIndex of chunk.indices) {
-        chunkMessageIndexOffsets.set(
-          messageIndex.channelId,
-          messageIndexStart + messageIndexLength,
-        );
-        messageIndexLength += builder.writeMessageIndex(messageIndex);
-      }
-
-      chunkIndexes.push({
-        type: "ChunkIndex",
-        messageStartTime: chunk.messageStartTime,
-        messageEndTime: chunk.messageEndTime,
-        chunkStartOffset,
-        chunkLength,
-        messageIndexOffsets: chunkMessageIndexOffsets,
-        messageIndexLength,
-        compression: "",
-        compressedSize: BigInt(chunk.buffer.byteLength),
-        uncompressedSize: BigInt(chunk.buffer.byteLength),
-      });
-    }
-
-    writeChunk(chunk1);
-    writeChunk(chunk2);
-    writeChunk(chunk3);
-    writeChunk(chunk4);
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk1));
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk2));
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk3));
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk4));
 
     builder.writeDataEnd({ dataSectionCrc: 0 });
 
@@ -545,6 +548,73 @@ describe("McapIndexedReader", () => {
       message5,
       message6,
     ]);
+  });
+
+  it("supports reading topics that only occur in some chunks", async () => {
+    const channel1: TypedMcapRecords["Channel"] = {
+      type: "Channel",
+      id: 1,
+      schemaId: 0,
+      topic: "a",
+      messageEncoding: "utf12",
+      metadata: new Map(),
+    };
+    const channel2: TypedMcapRecords["Channel"] = {
+      type: "Channel",
+      id: 2,
+      schemaId: 0,
+      topic: "b",
+      messageEncoding: "utf13",
+      metadata: new Map(),
+    };
+
+    const message1: TypedMcapRecords["Message"] = {
+      type: "Message",
+      channelId: channel1.id,
+      sequence: 0,
+      logTime: 0n,
+      publishTime: 0n,
+      data: new Uint8Array(),
+    };
+    const message2: TypedMcapRecords["Message"] = {
+      type: "Message",
+      channelId: channel2.id,
+      sequence: 0,
+      logTime: 1n,
+      publishTime: 1n,
+      data: new Uint8Array(),
+    };
+
+    const chunk1 = new ChunkBuilder({ useMessageIndex: true });
+    chunk1.addChannel(channel1);
+    chunk1.addMessage(message1);
+
+    const chunk2 = new ChunkBuilder({ useMessageIndex: true });
+    chunk2.addChannel(channel2);
+    chunk2.addMessage(message2);
+
+    const builder = new McapRecordBuilder();
+    builder.writeMagic();
+    builder.writeHeader({ profile: "", library: "" });
+
+    const chunkIndexes: TypedMcapRecords["ChunkIndex"][] = [];
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk1));
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk2));
+
+    builder.writeDataEnd({ dataSectionCrc: 0 });
+
+    const summaryStart = BigInt(builder.length);
+    builder.writeChannel(channel1);
+    builder.writeChannel(channel2);
+    for (const index of chunkIndexes) {
+      builder.writeChunkIndex(index);
+    }
+
+    builder.writeFooter({ summaryStart, summaryOffsetStart: 0n, summaryCrc: 0 });
+    builder.writeMagic();
+
+    const reader = await McapIndexedReader.Initialize({ readable: makeReadable(builder.buffer) });
+    await expect(collect(reader.readMessages({ topics: ["b"] }))).resolves.toEqual([message2]);
   });
 
   it("uses stable sort when loading overlapping chunks", async () => {
@@ -596,45 +666,9 @@ describe("McapIndexedReader", () => {
     builder.writeHeader({ profile: "", library: "" });
 
     const chunkIndexes: TypedMcapRecords["ChunkIndex"][] = [];
-    function writeChunk(chunk: ChunkBuilder) {
-      const chunkStartOffset = BigInt(builder.length);
-      const chunkLength = builder.writeChunk({
-        messageStartTime: chunk.messageStartTime,
-        messageEndTime: chunk.messageEndTime,
-        uncompressedSize: BigInt(chunk.buffer.length),
-        uncompressedCrc: 0,
-        compression: "",
-        records: chunk.buffer,
-      });
-
-      const messageIndexStart = BigInt(builder.length);
-      let messageIndexLength = 0n;
-      const chunkMessageIndexOffsets = new Map<number, bigint>();
-      for (const messageIndex of chunk.indices) {
-        chunkMessageIndexOffsets.set(
-          messageIndex.channelId,
-          messageIndexStart + messageIndexLength,
-        );
-        messageIndexLength += builder.writeMessageIndex(messageIndex);
-      }
-
-      chunkIndexes.push({
-        type: "ChunkIndex",
-        messageStartTime: chunk.messageStartTime,
-        messageEndTime: chunk.messageEndTime,
-        chunkStartOffset,
-        chunkLength,
-        messageIndexOffsets: chunkMessageIndexOffsets,
-        messageIndexLength,
-        compression: "",
-        compressedSize: BigInt(chunk.buffer.byteLength),
-        uncompressedSize: BigInt(chunk.buffer.byteLength),
-      });
-    }
-
-    writeChunk(chunk1);
-    writeChunk(chunk2);
-    writeChunk(chunk3);
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk1));
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk2));
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk3));
 
     builder.writeDataEnd({ dataSectionCrc: 0 });
 
@@ -672,6 +706,57 @@ describe("McapIndexedReader", () => {
       expect(readable.readCalls).toEqual(10);
 
       expect(collected).toEqual(expected);
+    }
+  });
+
+  it("handles multiple messages at same timestamp", async () => {
+    const tempBuffer = new TempBuffer();
+    const writer = new McapWriter({ writable: tempBuffer });
+    await writer.start({ library: "", profile: "" });
+    const channelId1 = await writer.registerChannel({
+      topic: "test1",
+      schemaId: 0,
+      messageEncoding: "",
+      metadata: new Map(),
+    });
+    const message1: TypedMcapRecords["Message"] = {
+      type: "Message",
+      channelId: channelId1,
+      sequence: 1,
+      logTime: 0n,
+      publishTime: 0n,
+      data: new Uint8Array([1]),
+    };
+    const message2: TypedMcapRecords["Message"] = {
+      type: "Message",
+      channelId: channelId1,
+      sequence: 2,
+      logTime: 0n,
+      publishTime: 0n,
+      data: new Uint8Array([2]),
+    };
+    const message3: TypedMcapRecords["Message"] = {
+      type: "Message",
+      channelId: channelId1,
+      sequence: 3,
+      logTime: 0n,
+      publishTime: 0n,
+      data: new Uint8Array([3]),
+    };
+    await writer.addMessage(message1);
+    await writer.addMessage(message2);
+    await writer.addMessage(message3);
+    await writer.end();
+
+    for (const reverse of [true, false]) {
+      let expected = [message1, message2, message3];
+      if (reverse) {
+        expected = expected.reverse();
+      }
+
+      const reader = await McapIndexedReader.Initialize({ readable: tempBuffer });
+
+      expect(await collect(reader.readMessages({ reverse }))).toEqual(expected);
     }
   });
 
@@ -722,44 +807,8 @@ describe("McapIndexedReader", () => {
     builder.writeHeader({ profile: "", library: "" });
 
     const chunkIndexes: TypedMcapRecords["ChunkIndex"][] = [];
-    function writeChunk(chunk: ChunkBuilder) {
-      const chunkStartOffset = BigInt(builder.length);
-      const chunkLength = builder.writeChunk({
-        messageStartTime: chunk.messageStartTime,
-        messageEndTime: chunk.messageEndTime,
-        uncompressedSize: BigInt(chunk.buffer.length),
-        uncompressedCrc: 0,
-        compression: "",
-        records: chunk.buffer,
-      });
-
-      const messageIndexStart = BigInt(builder.length);
-      let messageIndexLength = 0n;
-      const chunkMessageIndexOffsets = new Map<number, bigint>();
-      for (const messageIndex of chunk.indices) {
-        chunkMessageIndexOffsets.set(
-          messageIndex.channelId,
-          messageIndexStart + messageIndexLength,
-        );
-        messageIndexLength += builder.writeMessageIndex(messageIndex);
-      }
-
-      chunkIndexes.push({
-        type: "ChunkIndex",
-        messageStartTime: chunk.messageStartTime,
-        messageEndTime: chunk.messageEndTime,
-        chunkStartOffset,
-        chunkLength,
-        messageIndexOffsets: chunkMessageIndexOffsets,
-        messageIndexLength,
-        compression: "",
-        compressedSize: BigInt(chunk.buffer.byteLength),
-        uncompressedSize: BigInt(chunk.buffer.byteLength),
-      });
-    }
-
-    writeChunk(chunk1);
-    writeChunk(chunk2);
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk1));
+    chunkIndexes.push(writeChunkWithMessageIndexes(builder, chunk2));
 
     builder.writeDataEnd({ dataSectionCrc: 0 });
 
@@ -810,5 +859,269 @@ describe("McapIndexedReader", () => {
 
       expect(collected).toEqual([messageB1, messageB2].reverse());
     }
+  });
+
+  it("reads metadata records", async () => {
+    const data = [
+      ...MCAP_MAGIC,
+      ...record(Opcode.HEADER, [
+        ...string(""), // profile
+        ...string(""), // library
+      ]),
+    ];
+    const metadata1Start = data.length;
+    data.push(
+      ...record(Opcode.METADATA, [
+        ...string("foo"), // name
+        ...keyValues(string, string, [
+          ["a", "1"],
+          ["b", "2"],
+        ]), // metadata
+      ]),
+    );
+    const metadata2Start = data.length;
+    data.push(
+      ...record(Opcode.METADATA, [
+        ...string("bar"), // name
+        ...keyValues(string, string, [
+          ["x", "10"],
+          ["y", "20"],
+        ]), // metadata
+      ]),
+    );
+    const metadata3Start = data.length;
+    data.push(
+      ...record(Opcode.METADATA, [
+        ...string("foo"), // name
+        ...keyValues(string, string, [["b", "4"]]), // metadata
+      ]),
+    );
+    const dataEndStart = data.length;
+    data.push(
+      ...record(Opcode.DATA_END, [
+        ...uint32LE(0), // data crc
+      ]),
+    );
+    const summaryStart = data.length;
+    data.push(
+      ...record(Opcode.METADATA_INDEX, [
+        ...uint64LE(BigInt(metadata1Start)), // offset
+        ...uint64LE(BigInt(metadata2Start - metadata1Start)), // length
+        ...string("foo"), // name
+      ]),
+      ...record(Opcode.METADATA_INDEX, [
+        ...uint64LE(BigInt(metadata2Start)), // offset
+        ...uint64LE(BigInt(metadata3Start - metadata2Start)), // length
+        ...string("bar"), // name
+      ]),
+      ...record(Opcode.METADATA_INDEX, [
+        ...uint64LE(BigInt(metadata3Start)), // offset
+        ...uint64LE(BigInt(dataEndStart - metadata3Start)), // length
+        ...string("foo"), // name
+      ]),
+      ...record(Opcode.FOOTER, [
+        ...uint64LE(BigInt(summaryStart)), // summary start
+        ...uint64LE(0n), // summary offset start
+        ...uint32LE(0), // summary crc
+      ]),
+      ...MCAP_MAGIC,
+    );
+    const readable = makeReadable(new Uint8Array(data));
+    const reader = await McapIndexedReader.Initialize({ readable });
+
+    expect(reader.metadataIndexes).toHaveLength(3);
+
+    let metadata = await collect(reader.readMetadata());
+    expect(metadata).toEqual([
+      {
+        name: "foo",
+        metadata: new Map([
+          ["a", "1"],
+          ["b", "2"],
+        ]),
+        type: "Metadata",
+      },
+      {
+        name: "bar",
+        metadata: new Map([
+          ["x", "10"],
+          ["y", "20"],
+        ]),
+        type: "Metadata",
+      },
+      {
+        name: "foo",
+        metadata: new Map([["b", "4"]]),
+        type: "Metadata",
+      },
+    ]);
+
+    metadata = await collect(reader.readMetadata({ name: "bar" }));
+    expect(metadata).toEqual([
+      {
+        name: "bar",
+        metadata: new Map([
+          ["x", "10"],
+          ["y", "20"],
+        ]),
+        type: "Metadata",
+      },
+    ]);
+  });
+
+  it("reads attachment records", async () => {
+    const data = [
+      ...MCAP_MAGIC,
+      ...record(Opcode.HEADER, [
+        ...string(""), // profile
+        ...string(""), // library
+      ]),
+    ];
+    const attachment1Start = data.length;
+    data.push(
+      ...record(Opcode.ATTACHMENT, [
+        ...uint64LE(1n), // log time
+        ...uint64LE(2n), // create time
+        ...string("foo"), // name
+        ...string("text/plain"), // media type
+        ...uint64LE(5n), // data length
+        ...new Uint8Array([0x68, 0x65, 0x6c, 0x6c, 0x6f]), // data
+        ...uint32LE(0), // data crc
+      ]),
+    );
+    const attachment2Start = data.length;
+    data.push(
+      ...record(Opcode.ATTACHMENT, [
+        ...uint64LE(4n), // log time
+        ...uint64LE(5n), // create time
+        ...string("bar"), // name
+        ...string("application/octet-stream"), // media type
+        ...uint64LE(3n), // data length
+        ...new Uint8Array([1, 2, 3]), // data
+        ...uint32LE(0), // data crc
+      ]),
+    );
+    const attachment3Start = data.length;
+    data.push(
+      ...record(Opcode.ATTACHMENT, [
+        ...uint64LE(6n), // log time
+        ...uint64LE(7n), // create time
+        ...string("foo"), // name
+        ...string("application/json"), // media type
+        ...uint64LE(2n), // data length
+        ...new Uint8Array([0x7b, 0x7d]), // data
+        ...uint32LE(0), // data crc
+      ]),
+    );
+    const dataEndStart = data.length;
+    data.push(
+      ...record(Opcode.DATA_END, [
+        ...uint32LE(0), // data crc
+      ]),
+    );
+    const summaryStart = data.length;
+    data.push(
+      ...record(Opcode.ATTACHMENT_INDEX, [
+        ...uint64LE(BigInt(attachment1Start)), // offset
+        ...uint64LE(BigInt(attachment2Start - attachment1Start)), // length
+        ...uint64LE(1n), // log time
+        ...uint64LE(2n), // create time
+        ...uint64LE(5n), // data size
+        ...string("foo"), // name
+        ...string("text/plain"), // media type
+      ]),
+      ...record(Opcode.ATTACHMENT_INDEX, [
+        ...uint64LE(BigInt(attachment2Start)), // offset
+        ...uint64LE(BigInt(attachment3Start - attachment2Start)), // length
+        ...uint64LE(4n), // log time
+        ...uint64LE(5n), // create time
+        ...uint64LE(3n), // data size
+        ...string("bar"), // name
+        ...string("application/octet-stream"), // media type
+      ]),
+      ...record(Opcode.ATTACHMENT_INDEX, [
+        ...uint64LE(BigInt(attachment3Start)), // offset
+        ...uint64LE(BigInt(dataEndStart - attachment3Start)), // length
+        ...uint64LE(6n), // log time
+        ...uint64LE(7n), // create time
+        ...uint64LE(2n), // data size
+        ...string("foo"), // name
+        ...string("application/json"), // media type
+      ]),
+      ...record(Opcode.FOOTER, [
+        ...uint64LE(BigInt(summaryStart)), // summary start
+        ...uint64LE(0n), // summary offset start
+        ...uint32LE(0), // summary crc
+      ]),
+      ...MCAP_MAGIC,
+    );
+    const readable = makeReadable(new Uint8Array(data));
+    const reader = await McapIndexedReader.Initialize({ readable });
+
+    expect(reader.attachmentIndexes).toHaveLength(3);
+
+    let attachments = await collect(reader.readAttachments());
+    expect(attachments).toEqual([
+      {
+        name: "foo",
+        logTime: 1n,
+        createTime: 2n,
+        mediaType: "text/plain",
+        data: new Uint8Array([0x68, 0x65, 0x6c, 0x6c, 0x6f]),
+        type: "Attachment",
+      },
+      {
+        name: "bar",
+        logTime: 4n,
+        createTime: 5n,
+        mediaType: "application/octet-stream",
+        data: new Uint8Array([1, 2, 3]),
+        type: "Attachment",
+      },
+      {
+        name: "foo",
+        logTime: 6n,
+        createTime: 7n,
+        mediaType: "application/json",
+        data: new Uint8Array([0x7b, 0x7d]),
+        type: "Attachment",
+      },
+    ]);
+
+    attachments = await collect(reader.readAttachments({ name: "bar" }));
+    expect(attachments).toEqual([
+      {
+        name: "bar",
+        logTime: 4n,
+        createTime: 5n,
+        mediaType: "application/octet-stream",
+        data: new Uint8Array([1, 2, 3]),
+        type: "Attachment",
+      },
+    ]);
+
+    attachments = await collect(reader.readAttachments({ mediaType: "application/json" }));
+    expect(attachments).toEqual([
+      {
+        name: "foo",
+        logTime: 6n,
+        createTime: 7n,
+        mediaType: "application/json",
+        data: new Uint8Array([0x7b, 0x7d]),
+        type: "Attachment",
+      },
+    ]);
+
+    attachments = await collect(reader.readAttachments({ startTime: 3n, endTime: 5n }));
+    expect(attachments).toEqual([
+      {
+        name: "bar",
+        logTime: 4n,
+        createTime: 5n,
+        mediaType: "application/octet-stream",
+        data: new Uint8Array([1, 2, 3]),
+        type: "Attachment",
+      },
+    ]);
   });
 });

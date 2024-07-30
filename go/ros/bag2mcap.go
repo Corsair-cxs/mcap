@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 
 	"github.com/foxglove/mcap/go/mcap"
 	"github.com/pierrec/lz4/v4"
@@ -15,6 +16,10 @@ import (
 
 var (
 	BagMagic = []byte("#ROSBAG V2.0\n")
+)
+
+var (
+	ErrTooManyConnections = fmt.Errorf("bag contains connection ID > %d", math.MaxUint16)
 )
 
 type BagOp byte
@@ -58,23 +63,6 @@ func getUint32(buf []byte, offset int) (result uint32, newoffset int, err error)
 		return 0, 0, fmt.Errorf("short buffer")
 	}
 	return binary.LittleEndian.Uint32(buf[offset:]), offset + 4, nil
-}
-
-type ResettableReader interface {
-	io.Reader
-	Reset(io.Reader)
-}
-
-type resettableByteReader struct {
-	r io.Reader
-}
-
-func (r *resettableByteReader) Read(p []byte) (int, error) {
-	return r.r.Read(p)
-}
-
-func (r *resettableByteReader) Reset(reader io.Reader) {
-	r.r = reader
 }
 
 func extractHeaderValue(header []byte, key []byte) ([]byte, error) {
@@ -123,9 +111,7 @@ func processBag(
 	buf := make([]byte, 8)
 	data := make([]byte, 1024*1024)
 	chunkData := make([]byte, 1024*1024)
-
-	var chunkReader ResettableReader
-	var activeReader, baseReader io.Reader
+	var chunkReader, activeReader, baseReader io.Reader
 	baseReader = r
 	activeReader = r
 	for {
@@ -198,23 +184,15 @@ func processBag(
 			r := bytes.NewReader(chunkData[:datalen])
 			switch string(compression) {
 			case "lz4":
-				if chunkReader == nil {
-					chunkReader = lz4.NewReader(r)
+				if v, ok := chunkReader.(*lz4.Reader); ok {
+					v.Reset(r)
 				} else {
-					chunkReader.Reset(r)
+					chunkReader = lz4.NewReader(r)
 				}
 			case "bz2":
-				if chunkReader == nil {
-					chunkReader = &resettableByteReader{bzip2.NewReader(r)}
-				} else {
-					chunkReader.Reset(r)
-				}
+				chunkReader = bzip2.NewReader(r)
 			case "none":
-				if chunkReader == nil {
-					chunkReader = &resettableByteReader{r}
-				} else {
-					chunkReader.Reset(r)
-				}
+				chunkReader = r
 			default:
 				return fmt.Errorf("unsupported compression: %s", compression)
 			}
@@ -240,7 +218,14 @@ func processBag(
 	return nil
 }
 
-func Bag2MCAP(w io.Writer, r io.Reader, opts *mcap.WriterOptions) error {
+func channelIDForConnection(connID uint32) (uint16, error) {
+	if connID > math.MaxUint16 {
+		return 0, ErrTooManyConnections
+	}
+	return uint16(connID), nil
+}
+
+func Bag2MCAP(w io.Writer, r io.Reader, opts *mcap.WriterOptions, messageCallbacks ...func([]byte) error) error {
 	writer, err := mcap.NewWriter(w, opts)
 	if err != nil {
 		return err
@@ -261,7 +246,7 @@ func Bag2MCAP(w io.Writer, r io.Reader, opts *mcap.WriterOptions) error {
 			if err != nil {
 				return err
 			}
-			connID := binary.LittleEndian.Uint16(conn)
+			connID := binary.LittleEndian.Uint32(conn)
 			topic, err := extractHeaderValue(header, headerTopic)
 			if err != nil {
 				return err
@@ -275,7 +260,7 @@ func Bag2MCAP(w io.Writer, r io.Reader, opts *mcap.WriterOptions) error {
 			msgdef := connectionDataHeader["message_definition"]
 			delete(connectionDataHeader, "message_definition")
 
-			key := fmt.Sprintf("%s/%s", topic, connectionDataHeader["md5sum"])
+			key := fmt.Sprintf("%s/%s", typ, connectionDataHeader["md5sum"])
 			if _, ok := schemas[key]; !ok {
 				schemaID := uint16(len(schemas) + 1)
 				msgdefCopy := make([]byte, len(msgdef))
@@ -291,8 +276,12 @@ func Bag2MCAP(w io.Writer, r io.Reader, opts *mcap.WriterOptions) error {
 				}
 				schemas[key] = schemaID
 			}
+			channelID, err := channelIDForConnection(connID)
+			if err != nil {
+				return err
+			}
 			channelInfo := &mcap.Channel{
-				ID:              connID,
+				ID:              channelID,
 				Topic:           string(topic),
 				MessageEncoding: "ros1",
 				SchemaID:        schemas[key],
@@ -305,14 +294,18 @@ func Bag2MCAP(w io.Writer, r io.Reader, opts *mcap.WriterOptions) error {
 			if err != nil {
 				return err
 			}
-			connID := binary.LittleEndian.Uint16(conn)
+			connID := binary.LittleEndian.Uint32(conn)
 			time, err := extractHeaderValue(header, headerTime)
 			if err != nil {
 				return err
 			}
 			nsecs := rosTimeToNanoseconds(time)
+			channelID, err := channelIDForConnection(connID)
+			if err != nil {
+				return err
+			}
 			err = writer.WriteMessage(&mcap.Message{
-				ChannelID:   connID,
+				ChannelID:   channelID,
 				Sequence:    seq,
 				LogTime:     nsecs,
 				PublishTime: nsecs,
@@ -322,6 +315,12 @@ func Bag2MCAP(w io.Writer, r io.Reader, opts *mcap.WriterOptions) error {
 				return err
 			}
 			seq++
+			for _, callback := range messageCallbacks {
+				err = callback(data)
+				if err != nil {
+					return err
+				}
+			}
 			return nil
 		},
 		true,

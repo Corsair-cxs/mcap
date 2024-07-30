@@ -38,7 +38,7 @@ int main() {
   writer.addChannel(chatterPublisher);
 
   // Create a message payload. This would typically be done by your own
-  // serialiation library. In this example, we manually create ROS1 binary data
+  // serialization library. In this example, we manually create ROS1 binary data
   std::array<std::byte, 4 + 13> payload;
   const uint32_t length = 13;
   std::memcpy(payload.data(), &length, 4);
@@ -83,9 +83,21 @@ following dependencies:
 - [lz4](https://lz4.github.io/lz4/) (tested with [lz4/1.9.3](https://conan.io/center/lz4))
 - [zstd](https://facebook.github.io/zstd/) (tested with [zstd/1.5.2](https://conan.io/center/zstd))
 
+If your project does not need `lz4` or `zstd` support, you can optionally disable these by defining
+`MCAP_COMPRESSION_NO_LZ4` or `MCAP_COMPRESSION_NO_ZSTD` respectively.
+
+### Conan
+
 To simplify installation of dependencies, the [Conan](https://conan.io/) package
 manager can be used with the included
 [conanfile.py](https://github.com/foxglove/mcap/blob/main/cpp/mcap/conanfile.py).
+
+### CMake
+
+For using MCAP with CMake, the third-party [olympus-robotics/mcap_builder](https://github.com/olympus-robotics/mcap_builder) repository provides a helpful wrapper.
+
+### Alternatives
+
 If you use an alternative approach, such as CMake's FetchContent or directly
 vendoring the dependencies, make sure you use versions equal or greater than the
 versions listed above.
@@ -106,3 +118,15 @@ for full details. The high-level interfaces for reading and writing are
    - Update [`all/conandata.yml`](https://github.com/conan-io/conan-center-index/blob/master/recipes/mcap/all/conandata.yml) to add an entry pointing at the tarball from the new release tag. <!-- cspell: word conandata -->
    - Follow the instructions for [developing recipes locally](https://github.com/conan-io/conan-center-index/blob/master/docs/developing_recipes_locally.md) to test the recipe.
    - Examples of previous changes to the mcap recipe: https://github.com/conan-io/conan-center-index/commits/master/recipes/mcap
+
+## Changes to APIs
+
+This project uses a [semantic version](https://semver.org) number to notify users of changes to public APIs.
+This semantic version can be read from `types.hpp`, defined as `MCAP_LIBRARY_VERSION`.
+
+The public API includes names that can be included from the `.hpp` files in `include/mcap`, excluding anything namespaced under `mcap::internal`.
+
+This API version does not cover the compiled ABI of the library. Projects including `mcap` are expected
+to compile it from source as part of their build process.
+
+Build rules in CMake or `conanfile.py` files are not covered as part of this public API.

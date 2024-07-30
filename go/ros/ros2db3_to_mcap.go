@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -16,9 +17,10 @@ import (
 
 var (
 	messageTopicRegex = regexp.MustCompile(`\w+/msg/.*`)
+	errSchemaNotFound = errors.New("schema not found")
 )
 
-func getSchema(encoding string, rosType string, directories []string) ([]byte, error) {
+func getSchema(rosType string, directories []string) ([]byte, error) {
 	parts := strings.FieldsFunc(rosType, func(c rune) bool { return c == '/' })
 	if len(parts) < 3 {
 		return nil, fmt.Errorf("expected type %s to match <package>/msg/<type>", rosType)
@@ -39,8 +41,9 @@ func getSchema(encoding string, rosType string, directories []string) ([]byte, e
 		}
 		lines := strings.Split(string(schemaIndex), "\n")
 		for _, line := range lines {
-			if line == fmt.Sprintf("msg/%s.%s", baseType, encoding) {
-				schemaPath := path.Join(dir, "share", rosPkg, "msg", baseType+"."+encoding)
+			expectedMsgDefFilename := baseType + ".msg"
+			if _, filename := filepath.Split(line); filename == expectedMsgDefFilename {
+				schemaPath := path.Join(dir, "share", rosPkg, line)
 				schema, err := os.ReadFile(schemaPath)
 				if err != nil {
 					return nil, fmt.Errorf("failed to read schema: %w", err)
@@ -49,15 +52,15 @@ func getSchema(encoding string, rosType string, directories []string) ([]byte, e
 			}
 		}
 	}
-	return nil, fmt.Errorf("schema not found")
+	return nil, errSchemaNotFound
 }
 
-func getSchemas(encoding string, directories []string, types []string) (map[string][]byte, error) {
+func getSchemas(directories []string, types []string) (map[string][]byte, error) {
 	messageDefinitions := make(map[string][]byte)
 	for _, rosType := range types {
 		rosPackage := strings.Split(rosType, "/")[0]
 		messageDefinition := &bytes.Buffer{}
-		schema, err := getSchema(encoding, rosType, directories)
+		schema, err := getSchema(rosType, directories)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find schema for %s: %w", rosType, err)
 		}
@@ -68,6 +71,7 @@ func getSchemas(encoding string, directories []string, types []string) (map[stri
 		}{
 			{parentPackage: rosPackage, rosType: rosType, schema: schema},
 		}
+		seenSubtypes := map[string]struct{}{rosType: {}}
 		first := true
 		for len(subdefinitions) > 0 {
 			subdefinition := subdefinitions[0]
@@ -116,15 +120,16 @@ func getSchemas(encoding string, directories []string, types []string) (map[stri
 				}
 				fieldType := parts[0]
 
-				// it may be an array, but we just care about the base type
-				baseType := fieldType
-				arrayParts := strings.FieldsFunc(fieldType, func(c rune) bool { return c == '[' })
-				if len(arrayParts) > 1 {
-					baseType = arrayParts[0]
+				// bounded fields & arrays
+				if i := strings.Index(fieldType, "["); i > 0 {
+					fieldType = fieldType[:i]
+				}
+				if i := strings.Index(fieldType, "<"); i > 0 {
+					fieldType = fieldType[:i]
 				}
 
 				// if it's a primitive, no action required
-				if Primitives[baseType] {
+				if Primitives[fieldType] {
 					continue
 				}
 
@@ -134,20 +139,26 @@ func getSchemas(encoding string, directories []string, types []string) (map[stri
 				}
 
 				// if it's not a primitive, we need to look it up
-				qualifiedType := fieldToQualifiedROSType(baseType, parentPackage)
-				fieldSchema, err := getSchema(encoding, qualifiedType, directories)
+				qualifiedType := fieldToQualifiedROSType(fieldType, parentPackage)
+				fieldSchema, err := getSchema(qualifiedType, directories)
 				if err != nil {
-					return nil, fmt.Errorf("failed to find schema for %s: %w", baseType, err)
+					return nil, fmt.Errorf("failed to find schema for %s: %w", fieldType, err)
 				}
-				subdefinitions = append(subdefinitions, struct {
-					parentPackage string
-					rosType       string
-					schema        []byte
-				}{
-					parentPackage: parentPackage,
-					rosType:       qualifiedType,
-					schema:        fieldSchema,
-				})
+
+				// Only process new subtypes to avoid duplicate type definitions in the schema
+				_, knownSubtype := seenSubtypes[qualifiedType]
+				if !knownSubtype {
+					seenSubtypes[qualifiedType] = struct{}{}
+					subdefinitions = append(subdefinitions, struct {
+						parentPackage string
+						rosType       string
+						schema        []byte
+					}{
+						parentPackage: parentPackage,
+						rosType:       qualifiedType,
+						schema:        fieldSchema,
+					})
+				}
 			}
 		}
 		messageDefinitions[rosType] = messageDefinition.Bytes()
@@ -254,16 +265,22 @@ func transformMessages(db *sql.DB, f func(*sql.Rows) error) error {
 	return nil
 }
 
-func DB3ToMCAP(w io.Writer, db *sql.DB, opts *mcap.WriterOptions, searchdirs []string) error {
+func DB3ToMCAP(w io.Writer,
+	db *sql.DB,
+	opts *mcap.WriterOptions,
+	searchdirs []string,
+	callbacks ...func([]byte) error,
+) error {
 	topics, err := getTopics(db)
 	if err != nil {
 		return err
 	}
+
 	types := make([]string, len(topics))
 	for i := range topics {
 		types[i] = topics[i].typ
 	}
-	schemas, err := getSchemas("msg", searchdirs, types)
+	schemas, err := getSchemas(searchdirs, types)
 	if err != nil {
 		return err
 	}
@@ -334,6 +351,13 @@ func DB3ToMCAP(w io.Writer, db *sql.DB, opts *mcap.WriterOptions, searchdirs []s
 			return err
 		}
 		seq[topicID]++
+
+		for _, callback := range callbacks {
+			err = callback(messageData)
+			if err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {

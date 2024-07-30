@@ -8,3 +8,12 @@ __docs__
 dist
 site/
 .cache
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/sdks
+*.tgz
+
+*.db3-shm
+*.db3-wal
