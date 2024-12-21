@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use mcap::WriteOptions;
 
 use std::io::BufWriter;
 
@@ -10,8 +11,7 @@ use memmap::Mmap;
 use rayon::prelude::*;
 use tempfile::tempfile;
 
-#[test]
-fn demo_round_trip() -> Result<()> {
+fn demo_round_trip_for_opts(opts: WriteOptions) -> Result<()> {
     use mcap::records::op;
 
     let mapped = mcap_test_file()?;
@@ -19,7 +19,7 @@ fn demo_round_trip() -> Result<()> {
     let messages = mcap::MessageStream::new(&mapped)?;
 
     let mut tmp = tempfile()?;
-    let mut writer = mcap::Writer::new(BufWriter::new(&mut tmp))?;
+    let mut writer = opts.create(BufWriter::new(&mut tmp))?;
 
     for m in messages {
         // IRL, we'd add channels, then write messages to known channels,
@@ -27,6 +27,7 @@ fn demo_round_trip() -> Result<()> {
         // But since here we'd need to do the same anyways...
         writer.write(&m?)?;
     }
+
     drop(writer);
 
     let ours = unsafe { Mmap::map(&tmp) }?;
@@ -121,6 +122,16 @@ fn demo_round_trip() -> Result<()> {
 }
 
 #[test]
+fn demo_round_trip() -> Result<()> {
+    demo_round_trip_for_opts(Default::default())
+}
+
+#[test]
+fn demo_round_trip_buffered() -> Result<()> {
+    demo_round_trip_for_opts(WriteOptions::default().disable_seeking(true))
+}
+
+#[test]
 fn demo_random_chunk_access() -> Result<()> {
     let mapped = mcap_test_file()?;
 
@@ -145,7 +156,6 @@ fn demo_random_chunk_access() -> Result<()> {
     {
         assert_eq!(whole?, random?);
     }
-
     // Let's poke around the message indexes
     let mut index_entries = summary
         .read_message_indexes(&mapped, &summary.chunk_indexes[1])?

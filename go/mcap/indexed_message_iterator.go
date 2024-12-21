@@ -10,6 +10,8 @@ import (
 	"slices"
 	"sort"
 
+	"math"
+
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 )
@@ -54,6 +56,7 @@ type indexedMessageIterator struct {
 	attachmentIndexes []*AttachmentIndex
 	metadataIndexes   []*MetadataIndex
 	footer            *Footer
+	fileSize          int64
 
 	curChunkIndex   int
 	messageIndexes  []messageIndexWithChunkSlot
@@ -68,14 +71,28 @@ type indexedMessageIterator struct {
 	metadataCallback func(*Metadata) error
 }
 
+func (it *indexedMessageIterator) seekTo(offset uint64) error {
+	if offset > uint64(math.MaxInt64) {
+		return fmt.Errorf("%w: %d > int64 max", ErrBadOffset, offset)
+	}
+	signedOffset := int64(offset)
+	if signedOffset >= it.fileSize {
+		return fmt.Errorf("%w: %d past file end %d", ErrBadOffset, offset, it.fileSize)
+	}
+	_, err := it.rs.Seek(signedOffset, io.SeekStart)
+	return err
+}
+
 // parseIndexSection parses the index section of the file and populates the
 // related fields of the structure. It must be called prior to any of the other
 // access methods.
 func (it *indexedMessageIterator) parseSummarySection() error {
-	_, err := it.rs.Seek(-8-4-8-8, io.SeekEnd) // magic, plus 20 bytes footer
+	const footerStartOffsetFromEnd = 8 + 4 + 8 + 8 // magic, plus 20 bytes footer
+	footerStartPos, err := it.rs.Seek(-footerStartOffsetFromEnd, io.SeekEnd)
 	if err != nil {
 		return err
 	}
+	it.fileSize = footerStartPos + footerStartOffsetFromEnd
 	buf := make([]byte, 8+20)
 	_, err = io.ReadFull(it.rs, buf)
 	if err != nil {
@@ -83,7 +100,7 @@ func (it *indexedMessageIterator) parseSummarySection() error {
 	}
 	magic := buf[20:]
 	if !bytes.Equal(magic, Magic) {
-		return fmt.Errorf("not an MCAP file")
+		return &ErrBadMagic{location: magicLocationEnd, actual: magic}
 	}
 	footer, err := ParseFooter(buf[:20])
 	if err != nil {
@@ -96,9 +113,9 @@ func (it *indexedMessageIterator) parseSummarySection() error {
 		it.hasReadSummarySection = true
 		return nil
 	}
-	_, err = it.rs.Seek(int64(footer.SummaryStart), io.SeekStart)
+	err = it.seekTo(footer.SummaryStart)
 	if err != nil {
-		return fmt.Errorf("failed to seek to summary start")
+		return fmt.Errorf("failed to seek to summary start: %w", err)
 	}
 
 	lexer, err := NewLexer(bufio.NewReader(it.rs), &LexerOptions{
@@ -188,7 +205,7 @@ func (it *indexedMessageIterator) parseSummarySection() error {
 // loadChunk seeks to and decompresses a chunk into a chunk slot, then populates it.messageIndexes
 // with the offsets of messages in that chunk.
 func (it *indexedMessageIterator) loadChunk(chunkIndex *ChunkIndex) error {
-	_, err := it.rs.Seek(int64(chunkIndex.ChunkStartOffset), io.SeekStart)
+	err := it.seekTo(chunkIndex.ChunkStartOffset)
 	if err != nil {
 		return err
 	}
@@ -377,7 +394,7 @@ func (it *indexedMessageIterator) NextInto(msg *Message) (*Schema, *Channel, *Me
 		// take care of the metadata here
 		if it.metadataCallback != nil {
 			for _, idx := range it.metadataIndexes {
-				_, err := it.rs.Seek(int64(idx.Offset), io.SeekStart)
+				err := it.seekTo(idx.Offset)
 				if err != nil {
 					return nil, nil, nil, fmt.Errorf("failed to seek to metadata: %w", err)
 				}

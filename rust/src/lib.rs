@@ -75,9 +75,13 @@
 
 pub mod read;
 pub mod records;
+#[cfg(feature = "tokio")]
+pub mod tokio;
 pub mod write;
 
+mod chunk_sink;
 mod io_utils;
+pub mod sans_io;
 
 use std::{borrow::Cow, collections::BTreeMap, fmt, sync::Arc};
 
@@ -85,6 +89,14 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum McapError {
+    #[error("tried to write to output while attachment is in progress")]
+    AttachmentInProgress,
+    #[error("tried to write bytes to an attachment but no attachment was in progress")]
+    AttachmentNotInProgress,
+    #[error("tried to write {excess} more bytes to attachment than the requested attachment length {attachment_length}")]
+    AttachmentTooLarge { excess: u64, attachment_length: u64 },
+    #[error("tried to finish writing attachment but current length {current} was not expected length {expected}")]
+    AttachmentIncomplete { current: u64, expected: u64 },
     #[error("Bad magic number")]
     BadMagic,
     #[error("Footer record couldn't be found at the end of the file, before the magic bytes")]
@@ -119,6 +131,8 @@ pub enum McapError {
     UnexpectedEof,
     #[error("Chunk ended in the middle of a record")]
     UnexpectedEoc,
+    #[error("Record with opcode {opcode:02X} has length {len}, need at least {expected} to parse")]
+    RecordTooShort { opcode: u8, len: u64, expected: u64 },
     #[error("Message {0} referenced unknown channel {1}")]
     UnknownChannel(u32, u16),
     #[error("Channel `{0}` referenced unknown schema {1}")]
@@ -127,6 +141,12 @@ pub enum McapError {
     UnexpectedChunkRecord(u8),
     #[error("Unsupported compression format `{0}`")]
     UnsupportedCompression(String),
+    #[error("Error during decompression: `{0}`")]
+    DecompressionError(String),
+    #[error("chunk buffer exceeds usize max: `{0}`")]
+    ChunkBufferTooLarge(u64),
+    #[error("length exceeds usize max: `{0}`")]
+    TooLong(u64),
 }
 
 pub type McapResult<T> = Result<T, McapError>;
@@ -196,5 +216,18 @@ pub struct Attachment<'a> {
     pub data: Cow<'a, [u8]>,
 }
 
-pub use read::{MessageStream, Summary};
+pub use read::{parse_record, MessageStream, Summary};
 pub use write::{WriteOptions, Writer};
+
+// The following assertions ensure that the MCAP components can be sent between threads.
+mod assertions {
+    use super::*;
+    use static_assertions::assert_impl_all;
+    use std::io::Cursor;
+
+    assert_impl_all!(Writer<Cursor<Vec<u8>>>: Send);
+    assert_impl_all!(MessageStream: Send);
+    assert_impl_all!(sans_io::read::LinearReader: Send);
+    #[cfg(feature = "tokio")]
+    assert_impl_all!(tokio::read::RecordReader<Cursor<Vec<u8>>>: Send);
+}
