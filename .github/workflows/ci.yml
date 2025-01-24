@@ -160,7 +160,7 @@ jobs:
         with:
           toolchain: stable
           default: true
-      - run: cargo build --example=conformance_reader --example=conformance_reader_async --features=tokio
+      - run: cargo build --example=conformance_reader --example=conformance_reader_async --example=conformance_writer --features=tokio
         working-directory: rust
       - run: yarn install --immutable
       - run: yarn test:conformance:generate-inputs --verify
@@ -315,33 +315,37 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         if: ${{ !github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' }}
         with:
-          packages_dir: python/mcap/dist
-          repository_url: https://test.pypi.org/legacy/
-          skip_existing: true
+          packages-dir: python/mcap/dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          attestations: false # https://github.com/pypa/gh-action-pypi-publish/issues/283#issuecomment-2499296440
 
       - name: Publish mcap-protobuf-support to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         if: ${{ !github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' }}
         with:
-          repository_url: https://test.pypi.org/legacy/
-          skip_existing: true
-          packages_dir: python/mcap-protobuf-support/dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          packages-dir: python/mcap-protobuf-support/dist
+          attestations: false # https://github.com/pypa/gh-action-pypi-publish/issues/283#issuecomment-2499296440
 
       - name: Publish mcap-ros1-support to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         if: ${{ !github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' }}
         with:
-          repository_url: https://test.pypi.org/legacy/
-          skip_existing: true
-          packages_dir: python/mcap-ros1-support/dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          packages-dir: python/mcap-ros1-support/dist
+          attestations: false # https://github.com/pypa/gh-action-pypi-publish/issues/283#issuecomment-2499296440
 
       - name: Publish mcap-ros2-support to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         if: ${{ !github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' }}
         with:
-          repository_url: https://test.pypi.org/legacy/
-          skip_existing: true
-          packages_dir: python/mcap-ros2-support/dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          packages-dir: python/mcap-ros2-support/dist
+          attestations: false # https://github.com/pypa/gh-action-pypi-publish/issues/283#issuecomment-2499296440
 
       - name: Publish mcap to PyPI
         if: |
@@ -349,7 +353,7 @@ jobs:
           startsWith(github.ref, 'refs/tags/releases/python/mcap/v')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages_dir: python/mcap/dist
+          packages-dir: python/mcap/dist
 
       - name: Publish mcap-protobuf-support to PyPI
         if: |
@@ -357,7 +361,7 @@ jobs:
           startsWith(github.ref, 'refs/tags/releases/python/mcap-protobuf-support/v')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages_dir: python/mcap-protobuf-support/dist
+          packages-dir: python/mcap-protobuf-support/dist
 
       - name: Publish mcap-ros1-support to PyPI
         if: |
@@ -365,7 +369,7 @@ jobs:
           startsWith(github.ref, 'refs/tags/releases/python/mcap-ros1-support/v')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages_dir: python/mcap-ros1-support/dist
+          packages-dir: python/mcap-ros1-support/dist
 
       - name: Publish mcap-ros2-support to PyPI
         if: |
@@ -373,7 +377,7 @@ jobs:
           startsWith(github.ref, 'refs/tags/releases/python/mcap-ros2-support/v')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages_dir: python/mcap-ros2-support/dist
+          packages-dir: python/mcap-ros2-support/dist
 
   go:
     runs-on: ubuntu-latest
@@ -493,7 +497,7 @@ jobs:
           components: "rustfmt, clippy"
       - run: rustup target add wasm32-unknown-unknown
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -- --no-deps
+      - run: cargo clippy --all-targets -- --no-deps
       - run: cargo clippy --no-default-features -- --no-deps
       - run: cargo clippy --no-default-features --features lz4 -- --no-deps
       - run: cargo clippy --no-default-features --features zstd -- --no-deps

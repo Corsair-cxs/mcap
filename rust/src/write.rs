@@ -2,19 +2,22 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     io::{self, prelude::*, Cursor, SeekFrom},
     mem::size_of,
 };
 
+use bimap::BiHashMap;
 use binrw::prelude::*;
 use byteorder::{WriteBytesExt, LE};
+#[cfg(feature = "zstd")]
+use zstd::stream::{raw as zraw, zio};
 
 use crate::{
     chunk_sink::{ChunkMode, ChunkSink},
     io_utils::CountingCrcWriter,
     records::{self, op, AttachmentHeader, AttachmentIndex, MessageHeader, Record},
-    Attachment, Channel, Compression, McapError, McapResult, Message, Schema, MAGIC,
+    Attachment, Compression, McapError, McapResult, Message, Schema, MAGIC,
 };
 
 // re-export to help with linear writing
@@ -23,9 +26,9 @@ pub use binrw::io::NoSeek;
 pub use records::Metadata;
 
 enum WriteMode<W: Write + Seek> {
-    Raw(W, ChunkMode),
+    Raw(CountingCrcWriter<W>),
     Chunk(ChunkWriter<W>),
-    Attachment(AttachmentWriter<W>, ChunkMode),
+    Attachment(AttachmentWriter<CountingCrcWriter<W>>),
 }
 
 fn op_and_len<W: Write>(w: &mut W, op: u8, len: u64) -> io::Result<()> {
@@ -99,9 +102,18 @@ fn write_record<W: Write>(w: &mut W, r: &Record) -> io::Result<()> {
 pub struct WriteOptions {
     compression: Option<Compression>,
     profile: String,
+    library: String,
     chunk_size: Option<u64>,
     use_chunks: bool,
     disable_seeking: bool,
+    emit_statistics: bool,
+    emit_summary_offsets: bool,
+    emit_message_indexes: bool,
+    emit_chunk_indexes: bool,
+    emit_attachment_indexes: bool,
+    emit_metadata_indexes: bool,
+    repeat_channels: bool,
+    repeat_schemas: bool,
 }
 
 impl Default for WriteOptions {
@@ -112,9 +124,18 @@ impl Default for WriteOptions {
             #[cfg(not(feature = "zstd"))]
             compression: None,
             profile: String::new(),
+            library: String::from("mcap-rs-") + env!("CARGO_PKG_VERSION"),
             chunk_size: Some(1024 * 768),
             use_chunks: true,
             disable_seeking: false,
+            emit_statistics: true,
+            emit_summary_offsets: true,
+            emit_message_indexes: true,
+            emit_chunk_indexes: true,
+            emit_attachment_indexes: true,
+            emit_metadata_indexes: true,
+            repeat_channels: true,
+            repeat_schemas: true,
         }
     }
 }
@@ -136,6 +157,16 @@ impl WriteOptions {
     pub fn profile<S: Into<String>>(self, profile: S) -> Self {
         Self {
             profile: profile.into(),
+            ..self
+        }
+    }
+
+    /// specifies the library that should be written to the MCAP Header record.
+    /// This is a free-form string that can be used to identify the library that wrote the file.
+    /// It is not used for any other purpose.
+    pub fn library<S: Into<String>>(self, library: S) -> Self {
+        Self {
+            library: library.into(),
             ..self
         }
     }
@@ -174,42 +205,145 @@ impl WriteOptions {
         self
     }
 
+    /// Specifies in whether to write any records to the [summary
+    /// section](https://mcap.dev/spec#summary-section).
+    ///
+    /// If you want only want to include specific record types in the summary section, call this
+    /// method with `false` and then enable the records you want. This ensures that no unwanted
+    /// summary records will be written if the format changes in the future.
+    ///
+    /// Note that this does *not* control whether [summary offset
+    /// records](https://mcap.dev/spec#summary-offset-op0x0e) are written, because they
+    /// are not part of the [summary section](https://mcap.dev/spec#summary-section).
+    pub fn emit_summary_records(mut self, value: bool) -> Self {
+        self.emit_statistics = value;
+        self.emit_chunk_indexes = value;
+        self.emit_attachment_indexes = value;
+        self.emit_metadata_indexes = value;
+        self.repeat_channels = value;
+        self.repeat_schemas = value;
+        self
+    }
+
+    /// Specifies whether to write [summary offset
+    /// records](https://mcap.dev/spec#summary-offset-op0x0e). This is on by default.
+    pub fn emit_summary_offsets(mut self, emit_summary_offsets: bool) -> Self {
+        self.emit_summary_offsets = emit_summary_offsets;
+        self
+    }
+
+    /// Specifies whether to write a [statistics record](https://mcap.dev/spec#statistics-op0x0b) in
+    /// the [summary section](https://mcap.dev/spec#summary-section). This is on by default.
+    pub fn emit_statistics(mut self, emit_statistics: bool) -> Self {
+        self.emit_statistics = emit_statistics;
+        self
+    }
+
+    /// Specifies whether to write [message index
+    /// records](https://mcap.dev/spec#message-index-op0x07) after each chunk. This is on by
+    /// default.
+    pub fn emit_message_indexes(mut self, emit_message_indexes: bool) -> Self {
+        self.emit_message_indexes = emit_message_indexes;
+        self
+    }
+
+    /// Specifies whether to write [chunk index records](https://mcap.dev/spec#chunk-index-op0x08)
+    /// in the [summary section](https://mcap.dev/spec#summary-section). This is on by default.
+    pub fn emit_chunk_indexes(mut self, emit_chunk_indexes: bool) -> Self {
+        self.emit_chunk_indexes = emit_chunk_indexes;
+        self
+    }
+
+    /// Specifies whether to write [attachment index
+    /// records](https://mcap.dev/spec#attachment-index-op0x0a) in the [summary
+    /// section](https://mcap.dev/spec#summary-section). This is on by default.
+    pub fn emit_attachment_indexes(mut self, emit_attachment_indexes: bool) -> Self {
+        self.emit_attachment_indexes = emit_attachment_indexes;
+        self
+    }
+
+    /// Specifies whether to write [metadata index
+    /// records](https://mcap.dev/spec#metadata-index-op0x0d) in the [summary
+    /// section](https://mcap.dev/spec#summary-section). This is on by default.
+    pub fn emit_metadata_indexes(mut self, emit_metadata_indexes: bool) -> Self {
+        self.emit_metadata_indexes = emit_metadata_indexes;
+        self
+    }
+
+    /// Specifies whether to repeat each [channel record](https://mcap.dev/spec#channel-op0x04) from
+    /// the [data section](https://mcap.dev/spec#data-section) in the [summary
+    /// section](https://mcap.dev/spec#summary-section). This is on by default.
+    pub fn repeat_channels(mut self, repeat_channels: bool) -> Self {
+        self.repeat_channels = repeat_channels;
+        self
+    }
+
+    /// Specifies whether to repeat each [schema record](https://mcap.dev/spec#schema-op0x03) from
+    /// the [data section](https://mcap.dev/spec#data-section) in the [summary
+    /// section](https://mcap.dev/spec#summary-section). This is on by default.
+    pub fn repeat_schemas(mut self, repeat_schemas: bool) -> Self {
+        self.repeat_schemas = repeat_schemas;
+        self
+    }
+
     /// Creates a [`Writer`] whch writes to `w` using the given options
-    pub fn create<'a, W: Write + Seek>(self, w: W) -> McapResult<Writer<'a, W>> {
+    pub fn create<W: Write + Seek>(self, w: W) -> McapResult<Writer<W>> {
         Writer::with_options(w, self)
     }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ChannelContent<'a> {
+    topic: Cow<'a, str>,
+    schema_id: u16,
+    message_encoding: Cow<'a, str>,
+    metadata: Cow<'a, BTreeMap<String, String>>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct SchemaContent<'a> {
+    name: Cow<'a, str>,
+    encoding: Cow<'a, str>,
+    data: Cow<'a, [u8]>,
 }
 
 /// Writes an MCAP file to the given [writer](Write).
 ///
 /// Users should call [`finish()`](Self::finish) to flush the stream
 /// and check for errors when done; otherwise the result will be unwrapped on drop.
-pub struct Writer<'a, W: Write + Seek> {
+pub struct Writer<W: Write + Seek> {
     writer: Option<WriteMode<W>>,
+    is_finished: bool,
+    chunk_mode: ChunkMode,
     options: WriteOptions,
-    schemas: HashMap<Schema<'a>, u16>,
-    channels: HashMap<Channel<'a>, u16>,
+    schemas: BiHashMap<SchemaContent<'static>, u16>,
+    channels: BiHashMap<ChannelContent<'static>, u16>,
+    next_schema_id: u16,
+    next_channel_id: u16,
     chunk_indexes: Vec<records::ChunkIndex>,
+    attachment_count: u32,
     attachment_indexes: Vec<records::AttachmentIndex>,
+    metadata_count: u32,
     metadata_indexes: Vec<records::MetadataIndex>,
     /// Message start and end time, or None if there are no messages yet.
     message_bounds: Option<(u64, u64)>,
     channel_message_counts: BTreeMap<u16, u64>,
 }
 
-impl<'a, W: Write + Seek> Writer<'a, W> {
+impl<W: Write + Seek> Writer<W> {
     pub fn new(writer: W) -> McapResult<Self> {
         Self::with_options(writer, WriteOptions::default())
     }
 
-    fn with_options(mut writer: W, opts: WriteOptions) -> McapResult<Self> {
+    fn with_options(writer: W, opts: WriteOptions) -> McapResult<Self> {
+        let mut writer = CountingCrcWriter::new(writer);
         writer.write_all(MAGIC)?;
 
         write_record(
             &mut writer,
             &Record::Header(records::Header {
                 profile: opts.profile.clone(),
-                library: String::from("mcap-rs-") + env!("CARGO_PKG_VERSION"),
+                library: opts.library.clone(),
             }),
         )?;
 
@@ -231,89 +365,205 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
         };
 
         Ok(Self {
-            writer: Some(WriteMode::Raw(writer, chunk_mode)),
+            writer: Some(WriteMode::Raw(writer)),
+            is_finished: false,
             options: opts,
-            schemas: HashMap::new(),
-            channels: HashMap::new(),
-            chunk_indexes: Vec::new(),
-            attachment_indexes: Vec::new(),
-            metadata_indexes: Vec::new(),
+            chunk_mode,
+            schemas: Default::default(),
+            channels: Default::default(),
+            next_channel_id: 1,
+            next_schema_id: 1,
+            chunk_indexes: Default::default(),
+            attachment_count: 0,
+            attachment_indexes: Default::default(),
+            metadata_count: 0,
+            metadata_indexes: Default::default(),
             message_bounds: None,
             channel_message_counts: BTreeMap::new(),
         })
     }
 
-    /// Adds a channel (and its provided schema, if any), returning its ID.
+    /// Adds a schema, returning its ID. If a schema with the same content has been added already,
+    /// its ID is returned.
     ///
-    /// Useful with subequent calls to [`write_to_known_channel()`](Self::write_to_known_channel)
-    pub fn add_channel(&mut self, chan: &Channel<'a>) -> McapResult<u16> {
-        let schema_id = match &chan.schema {
-            Some(s) => self.add_schema(s)?,
-            None => 0,
-        };
-
-        if let Some(id) = self.channels.get(chan) {
-            return Ok(*id);
+    /// * `name`: an identifier for the schema.
+    /// * `encoding`: Describes the schema format.  The [well-known schema
+    ///   encodings](https://mcap.dev/spec/registry#well-known-schema-encodings) are preferred. An
+    ///   empty string indicates no schema is available.
+    /// * `data`: The serialized schema content. If `encoding` is an empty string, `data` should
+    ///   have zero length.
+    pub fn add_schema(&mut self, name: &str, encoding: &str, data: &[u8]) -> McapResult<u16> {
+        if let Some(&id) = self.schemas.get_by_left(&SchemaContent {
+            name: name.into(),
+            encoding: encoding.into(),
+            data: data.into(),
+        }) {
+            return Ok(id);
         }
-
-        let next_channel_id = self.channels.len() as u16;
-        assert!(self
-            .channels
-            .insert(chan.clone(), next_channel_id)
-            .is_none());
-        if self.options.use_chunks {
-            self.chunkin_time()?
-                .write_channel(next_channel_id, schema_id, chan)?;
-        } else {
-            write_record(
-                self.finish_chunk()?,
-                &Record::Channel(records::Channel {
-                    id: next_channel_id,
-                    schema_id,
-                    topic: chan.topic.clone(),
-                    message_encoding: chan.message_encoding.clone(),
-                    metadata: chan.metadata.clone(),
-                }),
-            )?;
+        while self.schemas.contains_right(&self.next_schema_id) {
+            if self.next_schema_id == u16::MAX {
+                return Err(McapError::TooManySchemas);
+            }
+            self.next_schema_id += 1;
         }
-        Ok(next_channel_id)
+        let id = self.next_schema_id;
+        self.next_schema_id += 1;
+        self.write_schema(Schema {
+            id,
+            name: name.into(),
+            encoding: encoding.into(),
+            data: Cow::Owned(data.into()),
+        })?;
+        Ok(id)
     }
 
-    fn add_schema(&mut self, schema: &Schema<'a>) -> McapResult<u16> {
-        if let Some(id) = self.schemas.get(schema) {
-            return Ok(*id);
-        }
-
-        // Schema IDs cannot be zero, that's the sentinel value in a channel
-        // for "no schema"
-        let next_schema_id = self.schemas.len() as u16 + 1;
-        assert!(self
-            .schemas
-            .insert(schema.clone(), next_schema_id)
-            .is_none());
+    fn write_schema(&mut self, schema: Schema) -> McapResult<()> {
+        self.schemas.insert(
+            SchemaContent {
+                name: Cow::Owned(schema.name.clone()),
+                encoding: Cow::Owned(schema.encoding.clone()),
+                data: Cow::Owned(schema.data.clone().into_owned()),
+            },
+            schema.id,
+        );
         if self.options.use_chunks {
-            self.chunkin_time()?.write_schema(next_schema_id, schema)?;
+            self.start_chunk()?.write_schema(schema)
         } else {
-            write_record(
-                self.finish_chunk()?,
+            let header = records::SchemaHeader {
+                id: schema.id,
+                name: schema.name,
+                encoding: schema.encoding,
+            };
+            Ok(write_record(
+                &mut self.finish_chunk()?,
                 &Record::Schema {
-                    header: records::SchemaHeader {
-                        id: next_schema_id,
-                        name: schema.name.clone(),
-                        encoding: schema.encoding.clone(),
-                    },
-                    data: Cow::Borrowed(&schema.data),
+                    header,
+                    data: schema.data,
                 },
-            )?;
+            )?)
         }
-        Ok(next_schema_id)
     }
 
-    /// Write the given message (and its provided channel, if needed).
-    pub fn write(&mut self, message: &Message<'a>) -> McapResult<()> {
-        let channel_id = self.add_channel(&message.channel)?;
+    /// Adds a channel, returning its ID. If a channel with equivalent content was added previously,
+    /// its ID is returned.
+    ///
+    /// Useful with subequent calls to [`write_to_known_channel()`](Self::write_to_known_channel).
+    ///
+    /// * `schema_id`: a schema_id returned from [`Self::add_schema`], or 0 if the channel has no
+    ///    schema.
+    /// * `topic`: The topic name.
+    /// * `message_encoding`: Encoding for messages on this channel. The [well-known message
+    ///    encodings](https://mcap.dev/spec/registry#well-known-message-encodings) are preferred.
+    ///  * `metadata`: Metadata about this channel.
+    pub fn add_channel(
+        &mut self,
+        schema_id: u16,
+        topic: &str,
+        message_encoding: &str,
+        metadata: &BTreeMap<String, String>,
+    ) -> McapResult<u16> {
+        if let Some(&id) = self.channels.get_by_left(&ChannelContent {
+            topic: Cow::Borrowed(topic),
+            schema_id,
+            message_encoding: Cow::Borrowed(message_encoding),
+            metadata: Cow::Borrowed(metadata),
+        }) {
+            return Ok(id);
+        }
+        if schema_id != 0 && self.schemas.get_by_right(&schema_id).is_none() {
+            return Err(McapError::UnknownSchema(topic.into(), schema_id));
+        }
+
+        while self.channels.contains_right(&self.next_channel_id) {
+            if self.next_channel_id == u16::MAX {
+                return Err(McapError::TooManyChannels);
+            }
+            self.next_channel_id += 1;
+        }
+        let id = self.next_channel_id;
+        self.next_channel_id += 1;
+
+        self.write_channel(records::Channel {
+            id,
+            schema_id,
+            topic: topic.into(),
+            message_encoding: message_encoding.into(),
+            metadata: metadata.clone(),
+        })?;
+        Ok(id)
+    }
+
+    fn write_channel(&mut self, channel: records::Channel) -> McapResult<()> {
+        self.channels.insert(
+            ChannelContent {
+                topic: Cow::Owned(channel.topic.clone()),
+                schema_id: channel.schema_id,
+                message_encoding: Cow::Owned(channel.message_encoding.clone()),
+                metadata: Cow::Owned(channel.metadata.clone()),
+            },
+            channel.id,
+        );
+        if self.options.use_chunks {
+            self.start_chunk()?.write_channel(channel)
+        } else {
+            Ok(write_record(
+                self.finish_chunk()?,
+                &Record::Channel(channel),
+            )?)
+        }
+    }
+
+    /// Write the given message (and its provided channel, if not already added).
+    /// The provided channel ID and schema ID will be used as IDs in the resulting MCAP.
+    pub fn write(&mut self, message: &Message) -> McapResult<()> {
+        if let Some(schema) = message.channel.schema.as_ref() {
+            match self.schemas.get_by_right(&schema.id) {
+                Some(previous) => {
+                    // ensure that this message schema does not conflict with the existing one's content
+                    let current = SchemaContent {
+                        name: Cow::Borrowed(&schema.name),
+                        encoding: Cow::Borrowed(&schema.encoding),
+                        data: Cow::Borrowed(&schema.data),
+                    };
+                    if *previous != current {
+                        return Err(McapError::ConflictingSchemas(schema.name.clone()));
+                    }
+                }
+                None => {
+                    self.write_schema(schema.as_ref().clone())?;
+                }
+            }
+        }
+        let schema_id = match message.channel.schema.as_ref() {
+            None => 0,
+            Some(schema) => schema.id,
+        };
+        match self.channels.get_by_right(&message.channel.id) {
+            Some(previous) => {
+                let current = ChannelContent {
+                    topic: Cow::Borrowed(&message.channel.topic),
+                    schema_id,
+                    message_encoding: Cow::Borrowed(&message.channel.message_encoding),
+                    metadata: Cow::Borrowed(&message.channel.metadata),
+                };
+                if *previous != current {
+                    return Err(McapError::ConflictingChannels(
+                        message.channel.topic.clone(),
+                    ));
+                }
+            }
+            None => {
+                self.write_channel(records::Channel {
+                    id: message.channel.id,
+                    schema_id: message.channel.schema.as_ref().map(|s| s.id).unwrap_or(0),
+                    topic: message.channel.topic.clone(),
+                    message_encoding: message.channel.message_encoding.clone(),
+                    metadata: message.channel.metadata.clone(),
+                })?;
+            }
+        }
         let header = MessageHeader {
-            channel_id,
+            channel_id: message.channel.id,
             sequence: message.sequence,
             log_time: message.log_time,
             publish_time: message.publish_time,
@@ -330,9 +580,7 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
         header: &MessageHeader,
         data: &[u8],
     ) -> McapResult<()> {
-        // The number of channels should be relatively small,
-        // do a quick linear search to make sure we're not being given a bogus ID
-        if !self.channels.values().any(|id| *id == header.channel_id) {
+        if !self.channels.contains_right(&header.channel_id) {
             return Err(McapError::UnknownChannel(
                 header.sequence,
                 header.channel_id,
@@ -350,20 +598,16 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
 
         // if the current chunk is larger than our target chunk size, finish it
         // and start a new one.
-        let current_chunk_size = match &self.writer {
-            Some(WriteMode::Chunk(cw)) => Some(cw.compressor.position()),
-            _ => None,
-        };
-        if let (Some(current_chunk_size), Some(target)) =
-            (current_chunk_size, self.options.chunk_size)
+        if let (Some(WriteMode::Chunk(cw)), Some(target)) = (&self.writer, self.options.chunk_size)
         {
+            let current_chunk_size = cw.compressor.position();
             if current_chunk_size > target {
                 self.finish_chunk()?;
             }
         }
 
         if self.options.use_chunks {
-            self.chunkin_time()?.write_message(header, data)?;
+            self.start_chunk()?.write_message(header, data)?;
         } else {
             write_record(
                 self.finish_chunk()?,
@@ -427,18 +671,17 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
     ) -> McapResult<()> {
         self.finish_chunk()?;
 
-        let prev_writer = self.writer.take().expect(Self::WHERE_WRITER);
-
-        let WriteMode::Raw(w, chunk_mode) = prev_writer else {
-            panic!(
+        let WriteMode::Raw(w) = self.writer.take().expect(Self::WRITER_IS_NONE) else {
+            unreachable!(
                 "since finish_chunk was called, write mode is guaranteed to be raw at this point"
             );
         };
 
-        self.writer = Some(WriteMode::Attachment(
-            AttachmentWriter::new(w, attachment_length, header)?,
-            chunk_mode,
-        ));
+        self.writer = Some(WriteMode::Attachment(AttachmentWriter::new(
+            w,
+            attachment_length,
+            header,
+        )?));
 
         Ok(())
     }
@@ -449,7 +692,7 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
     ///
     /// Before calling this method call [`Self::start_attachment`].
     pub fn put_attachment_bytes(&mut self, bytes: &[u8]) -> McapResult<()> {
-        let Some(WriteMode::Attachment(writer, _)) = &mut self.writer else {
+        let Some(WriteMode::Attachment(writer)) = &mut self.writer else {
             return Err(McapError::AttachmentNotInProgress);
         };
 
@@ -469,20 +712,24 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
             return Err(McapError::AttachmentNotInProgress);
         };
 
-        let Some(WriteMode::Attachment(writer, chunk_mode)) = self.writer.take() else {
+        let Some(WriteMode::Attachment(writer)) = self.writer.take() else {
             panic!("WriteMode is guaranteed to be attachment by this point");
         };
 
         let (writer, attachment_index) = writer.finish()?;
+        self.attachment_count += 1;
 
-        self.attachment_indexes.push(attachment_index);
+        if self.options.emit_attachment_indexes {
+            self.attachment_indexes.push(attachment_index);
+        }
 
-        self.writer = Some(WriteMode::Raw(writer, chunk_mode));
+        self.writer = Some(WriteMode::Raw(writer));
 
         Ok(())
     }
 
-    /// Write an attachment to the MCAP file
+    /// Write an attachment to the MCAP file. This finishes any current chunk before writing the
+    /// attachment.
     pub fn attach(&mut self, attachment: &Attachment) -> McapResult<()> {
         let header = records::AttachmentHeader {
             log_time: attachment.log_time,
@@ -498,6 +745,8 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
         Ok(())
     }
 
+    /// Write a [Metadata](https://mcap.dev/spec#metadata-op0x0c) record to the MCAP file. This
+    /// finishes any current chunk before writing the metadata.
     pub fn write_metadata(&mut self, metadata: &Metadata) -> McapResult<()> {
         let w = self.finish_chunk()?;
         let offset = w.stream_position()?;
@@ -507,11 +756,14 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
 
         let length = w.stream_position()? - offset;
 
-        self.metadata_indexes.push(records::MetadataIndex {
-            offset,
-            length,
-            name: metadata.name.clone(),
-        });
+        self.metadata_count += 1;
+        if self.options.emit_metadata_indexes {
+            self.metadata_indexes.push(records::MetadataIndex {
+                offset,
+                length,
+                name: metadata.name.clone(),
+            });
+        }
 
         Ok(())
     }
@@ -536,34 +788,43 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
         Ok(())
     }
 
-    /// `.expect()` message when we go to write and self.writer is `None`,
-    /// which should only happen when [`Writer::finish()`] was called.
-    const WHERE_WRITER: &'static str = "Trying to write a record on a finished MCAP";
+    const WRITER_IS_NONE: &'static str = "unreachable: self.writer should never be None";
+
+    fn assert_not_finished(&self) {
+        assert!(
+            !self.is_finished,
+            "{}",
+            "Trying to write a record on a finished MCAP"
+        );
+    }
 
     /// Starts a new chunk if we haven't done so already.
-    fn chunkin_time(&mut self) -> McapResult<&mut ChunkWriter<W>> {
+    fn start_chunk(&mut self) -> McapResult<&mut ChunkWriter<W>> {
+        self.assert_not_finished();
+
         // It is not possible to start writing a chunk if we're still writing an attachment. Return
         // an error instead.
         if let Some(WriteMode::Attachment(..)) = self.writer {
             return Err(McapError::AttachmentNotInProgress);
         }
 
-        // Some Rust tricky: we can't move the writer out of self.writer,
-        // leave that empty for a bit, and then replace it with a ChunkWriter.
-        // (That would leave it in an unspecified state if we bailed here!)
-        // Instead briefly swap it out for a null writer while we set up the chunker
-        // The writer will only be None if finish() was called.
         assert!(
             self.options.use_chunks,
             "Trying to write to a chunk when chunking is disabled"
         );
 
-        let prev_writer = self.writer.take().expect(Self::WHERE_WRITER);
-
-        self.writer = Some(match prev_writer {
-            WriteMode::Raw(w, chunk_mode) => {
+        // Rust forbids moving values out of a &mut reference. We made self.writer an Option so we
+        // can work around this by using take() to temporarily replace it with None while we
+        // construct the ChunkWriter.
+        self.writer = Some(match self.writer.take().expect(Self::WRITER_IS_NONE) {
+            WriteMode::Raw(w) => {
                 // It's chunkin time.
-                WriteMode::Chunk(ChunkWriter::new(w, self.options.compression, chunk_mode)?)
+                WriteMode::Chunk(ChunkWriter::new(
+                    w,
+                    self.options.compression,
+                    std::mem::take(&mut self.chunk_mode),
+                    self.options.emit_message_indexes,
+                )?)
             }
             chunk => chunk,
         });
@@ -576,26 +837,26 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
     }
 
     /// Finish the current chunk, if we have one.
-    fn finish_chunk(&mut self) -> McapResult<&mut W> {
+    fn finish_chunk(&mut self) -> McapResult<&mut CountingCrcWriter<W>> {
+        self.assert_not_finished();
         // If we're currently writing an attachment then we're not writing a chunk. Return an
         // error instead.
         if let Some(WriteMode::Attachment(..)) = self.writer {
             return Err(McapError::AttachmentNotInProgress);
         }
 
-        // See above
-        let prev_writer = self.writer.take().expect(Self::WHERE_WRITER);
-
-        self.writer = Some(match prev_writer {
+        // See start_chunk() for why we use take() here.
+        self.writer = Some(match self.writer.take().expect(Self::WRITER_IS_NONE) {
             WriteMode::Chunk(c) => {
                 let (w, mode, index) = c.finish()?;
                 self.chunk_indexes.push(index);
-                WriteMode::Raw(w, mode)
+                self.chunk_mode = mode;
+                WriteMode::Raw(w)
             }
             mode => mode,
         });
 
-        let Some(WriteMode::Raw(w, _)) = &mut self.writer else {
+        let Some(WriteMode::Raw(w)) = &mut self.writer else {
             unreachable!("we're not in an attachment and write mode raw was set above")
         };
 
@@ -606,7 +867,7 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
     ///
     /// Subsequent calls to other methods will panic.
     pub fn finish(&mut self) -> McapResult<()> {
-        if self.writer.is_none() {
+        if self.is_finished {
             // We already called finish().
             // Maybe we're dropping after the user called it?
             return Ok(());
@@ -614,29 +875,30 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
 
         // Finish any chunk we were working on and update stats, indexes, etc.
         self.finish_chunk()?;
+        self.is_finished = true;
 
         // Grab the writer - self.writer becoming None makes subsequent writes fail.
-        let mut writer = match self.writer.take() {
+        let writer = match &mut self.writer {
             // We called finish_chunk() above, so we're back to raw writes for
             // the summary section.
-            Some(WriteMode::Raw(w, _)) => w,
+            Some(WriteMode::Raw(w)) => w,
             _ => unreachable!(),
         };
-        let writer = &mut writer;
+        let data_section_crc = writer.current_checksum();
+        let writer = writer.get_mut();
 
         // We're done with the data secton!
-        write_record(writer, &Record::DataEnd(records::DataEnd::default()))?;
+        write_record(
+            writer,
+            &Record::DataEnd(records::DataEnd { data_section_crc }),
+        )?;
 
         // Take all the data we need, swapping in empty containers.
         // Without this, we get yelled at for moving things out of a mutable ref
         // (&mut self).
         // (We could get around all this noise by having finish() take self,
         // but then it wouldn't be droppable _and_ finish...able.)
-        let mut channel_message_counts = BTreeMap::new();
-        std::mem::swap(
-            &mut channel_message_counts,
-            &mut self.channel_message_counts,
-        );
+        let channel_message_counts = std::mem::take(&mut self.channel_message_counts);
 
         // Grab stats before we munge all the self fields below.
         let message_bounds = self.message_bounds.unwrap_or((0, 0));
@@ -644,167 +906,153 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
             message_count: channel_message_counts.values().sum(),
             schema_count: self.schemas.len() as u16,
             channel_count: self.channels.len() as u32,
-            attachment_count: self.attachment_indexes.len() as u32,
-            metadata_count: self.metadata_indexes.len() as u32,
+            attachment_count: self.attachment_count,
+            metadata_count: self.metadata_count,
             chunk_count: self.chunk_indexes.len() as u32,
             message_start_time: message_bounds.0,
             message_end_time: message_bounds.1,
             channel_message_counts,
         };
 
-        let mut chunk_indexes = Vec::new();
-        std::mem::swap(&mut chunk_indexes, &mut self.chunk_indexes);
+        let chunk_indexes = std::mem::take(&mut self.chunk_indexes);
+        let attachment_indexes = std::mem::take(&mut self.attachment_indexes);
+        let metadata_indexes = std::mem::take(&mut self.metadata_indexes);
 
-        let mut attachment_indexes = Vec::new();
-        std::mem::swap(&mut attachment_indexes, &mut self.attachment_indexes);
-
-        let mut metadata_indexes = Vec::new();
-        std::mem::swap(&mut metadata_indexes, &mut self.metadata_indexes);
-
-        // Make some Schema and Channel lists for the summary section.
-        // Be sure to grab schema IDs for the channels from the schema hash map before we drain it!
-        struct ChannelSummary<'a> {
-            channel: Channel<'a>,
-            channel_id: u16,
-            schema_id: u16,
-        }
-
-        let mut all_channels: Vec<ChannelSummary<'_>> = self
+        let all_channels: Vec<_> = self
             .channels
-            .drain()
-            .map(|(channel, channel_id)| {
-                let schema_id = match &channel.schema {
-                    Some(s) => *self.schemas.get(s).unwrap(),
-                    None => 0,
-                };
-
-                ChannelSummary {
-                    channel,
-                    channel_id,
-                    schema_id,
-                }
+            .iter()
+            .map(|(content, &id)| records::Channel {
+                id,
+                schema_id: content.schema_id,
+                topic: content.topic.clone().into(),
+                message_encoding: content.message_encoding.clone().into(),
+                metadata: content.metadata.clone().into_owned(),
             })
             .collect();
-        all_channels.sort_unstable_by_key(|cs| cs.channel_id);
+        let all_schemas: Vec<_> = self
+            .schemas
+            .iter()
+            .map(|(content, &id)| Record::Schema {
+                header: records::SchemaHeader {
+                    id,
+                    name: content.name.clone().into(),
+                    encoding: content.encoding.clone().into(),
+                },
+                data: content.data.clone(),
+            })
+            .collect();
 
-        let mut all_schemas: Vec<(Schema<'_>, u16)> = self.schemas.drain().collect();
-        all_schemas.sort_unstable_by_key(|(_, v)| *v);
+        let summary_start;
+        let summary_offset_start;
+        // Let's get a CRC of the summary section.
+        let mut ccw;
 
         let mut offsets = Vec::new();
 
-        let summary_start = writer.stream_position()?;
-
-        // Let's get a CRC of the summary section.
-        let mut ccw = CountingCrcWriter::new(writer);
+        summary_start = writer.stream_position()?;
+        let mut summary_end = summary_start;
+        ccw = CountingCrcWriter::new(writer);
 
         fn posit<W: Write + Seek>(ccw: &mut CountingCrcWriter<W>) -> io::Result<u64> {
             ccw.get_mut().stream_position()
         }
 
         // Write all schemas.
-        let schemas_start = summary_start;
-        for (schema, id) in all_schemas {
-            let header = records::SchemaHeader {
-                id,
-                name: schema.name,
-                encoding: schema.encoding,
-            };
-            let data = schema.data;
-
-            write_record(&mut ccw, &Record::Schema { header, data })?;
-        }
-        let schemas_end = posit(&mut ccw)?;
-        if schemas_end - schemas_start > 0 {
+        if self.options.repeat_schemas && !all_schemas.is_empty() {
+            let schemas_start: u64 = summary_start;
+            for schema in all_schemas.iter() {
+                write_record(&mut ccw, schema)?;
+            }
+            summary_end = posit(&mut ccw)?;
             offsets.push(records::SummaryOffset {
                 group_opcode: op::SCHEMA,
                 group_start: schemas_start,
-                group_length: schemas_end - schemas_start,
+                group_length: summary_end - schemas_start,
             });
         }
 
         // Write all channels.
-        let channels_start = schemas_end;
-        for cs in all_channels {
-            let rec = records::Channel {
-                id: cs.channel_id,
-                schema_id: cs.schema_id,
-                topic: cs.channel.topic,
-                message_encoding: cs.channel.message_encoding,
-                metadata: cs.channel.metadata,
-            };
-            write_record(&mut ccw, &Record::Channel(rec))?;
-        }
-        let channels_end = posit(&mut ccw)?;
-        if channels_end - channels_start > 0 {
+        if self.options.repeat_channels && !all_channels.is_empty() {
+            let channels_start = summary_end;
+            for channel in all_channels {
+                write_record(&mut ccw, &Record::Channel(channel))?;
+            }
+            summary_end = posit(&mut ccw)?;
             offsets.push(records::SummaryOffset {
                 group_opcode: op::CHANNEL,
                 group_start: channels_start,
-                group_length: channels_end - channels_start,
+                group_length: summary_end - channels_start,
             });
         }
 
-        let chunk_indexes_end;
-        if self.options.use_chunks {
+        if self.options.emit_statistics {
+            let statistics_start = summary_end;
+            write_record(&mut ccw, &Record::Statistics(stats))?;
+            summary_end = posit(&mut ccw)?;
+            offsets.push(records::SummaryOffset {
+                group_opcode: op::STATISTICS,
+                group_start: statistics_start,
+                group_length: summary_end - statistics_start,
+            });
+        }
+
+        if self.options.emit_chunk_indexes && !chunk_indexes.is_empty() {
             // Write all chunk indexes.
-            let chunk_indexes_start = channels_end;
+            let chunk_indexes_start = summary_end;
             for index in chunk_indexes {
                 write_record(&mut ccw, &Record::ChunkIndex(index))?;
             }
-            chunk_indexes_end = posit(&mut ccw)?;
-            if chunk_indexes_end - chunk_indexes_start > 0 {
-                offsets.push(records::SummaryOffset {
-                    group_opcode: op::CHUNK_INDEX,
-                    group_start: chunk_indexes_start,
-                    group_length: chunk_indexes_end - chunk_indexes_start,
-                });
-            }
-        } else {
-            chunk_indexes_end = channels_end;
+            summary_end = posit(&mut ccw)?;
+            offsets.push(records::SummaryOffset {
+                group_opcode: op::CHUNK_INDEX,
+                group_start: chunk_indexes_start,
+                group_length: summary_end - chunk_indexes_start,
+            });
         }
 
         // ...and attachment indexes
-        let attachment_indexes_start = chunk_indexes_end;
-        for index in attachment_indexes {
-            write_record(&mut ccw, &Record::AttachmentIndex(index))?;
-        }
-        let attachment_indexes_end = posit(&mut ccw)?;
-        if attachment_indexes_end - attachment_indexes_start > 0 {
+        if self.options.emit_attachment_indexes && !attachment_indexes.is_empty() {
+            let attachment_indexes_start = summary_end;
+            for index in attachment_indexes {
+                write_record(&mut ccw, &Record::AttachmentIndex(index))?;
+            }
+            summary_end = posit(&mut ccw)?;
             offsets.push(records::SummaryOffset {
                 group_opcode: op::ATTACHMENT_INDEX,
                 group_start: attachment_indexes_start,
-                group_length: attachment_indexes_end - attachment_indexes_start,
+                group_length: summary_end - attachment_indexes_start,
             });
         }
 
         // ...and metadata indexes
-        let metadata_indexes_start = attachment_indexes_end;
-        for index in metadata_indexes {
-            write_record(&mut ccw, &Record::MetadataIndex(index))?;
-        }
-        let metadata_indexes_end = posit(&mut ccw)?;
-        if metadata_indexes_end - metadata_indexes_start > 0 {
+        if self.options.emit_metadata_indexes && !metadata_indexes.is_empty() {
+            let metadata_indexes_start = summary_end;
+            for index in metadata_indexes {
+                write_record(&mut ccw, &Record::MetadataIndex(index))?;
+            }
+            summary_end = posit(&mut ccw)?;
             offsets.push(records::SummaryOffset {
                 group_opcode: op::METADATA_INDEX,
                 group_start: metadata_indexes_start,
-                group_length: metadata_indexes_end - metadata_indexes_start,
+                group_length: summary_end - metadata_indexes_start,
             });
         }
 
-        let stats_start = metadata_indexes_end;
-        write_record(&mut ccw, &Record::Statistics(stats))?;
-        let stats_end = posit(&mut ccw)?;
-        assert!(stats_end > stats_start);
-        offsets.push(records::SummaryOffset {
-            group_opcode: op::STATISTICS,
-            group_start: stats_start,
-            group_length: stats_end - stats_start,
-        });
-
         // Write the summary offsets we've been accumulating
-        let summary_offset_start = stats_end;
-        for offset in offsets {
-            write_record(&mut ccw, &Record::SummaryOffset(offset))?;
+        if self.options.emit_summary_offsets {
+            summary_offset_start = summary_end;
+            for offset in offsets {
+                write_record(&mut ccw, &Record::SummaryOffset(offset))?;
+            }
+        } else {
+            summary_offset_start = 0;
         }
+
+        let summary_start = if summary_end > summary_start {
+            summary_start
+        } else {
+            0 // We didn't write anything to the summary section.
+        };
 
         // Wat: the CRC in the footer _includes_ part of the footer.
         op_and_len(&mut ccw, op::FOOTER, 20)?;
@@ -813,15 +1061,31 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
 
         let (writer, summary_crc) = ccw.finalize();
 
-        writer.write_u32::<LE>(summary_crc)?;
+        writer.write_u32::<LE>(summary_crc.finalize())?;
 
         writer.write_all(MAGIC)?;
         writer.flush()?;
         Ok(())
     }
+
+    /// Consumes this writer, returning the underlying stream. Unless [`Self::finish()`] was called
+    /// first, the underlying stream __will not contain a complete MCAP.__
+    ///
+    /// Use this if you wish to handle any errors returned when the underlying stream is closed. In
+    /// particular, if using [`std::fs::File`], you may wish to call [`std::fs::File::sync_all()`]
+    /// to ensure all data was sent to the filesystem.
+    pub fn into_inner(mut self) -> W {
+        self.is_finished = true;
+        // Peel away all the layers of the writer to get the underlying stream.
+        match self.writer.take().expect(Self::WRITER_IS_NONE) {
+            WriteMode::Raw(w) => w.finalize().0,
+            WriteMode::Attachment(w) => w.writer.finalize().0.finalize().0,
+            WriteMode::Chunk(w) => w.compressor.finalize().0.into_inner().finalize().0.inner,
+        }
+    }
 }
 
-impl<'a, W: Write + Seek> Drop for Writer<'a, W> {
+impl<W: Write + Seek> Drop for Writer<W> {
     fn drop(&mut self) {
         self.finish().unwrap()
     }
@@ -829,8 +1093,10 @@ impl<'a, W: Write + Seek> Drop for Writer<'a, W> {
 
 enum Compressor<W: Write> {
     Null(W),
+    // zstd's Encoder wrapper doesn't let us get the inner writer without calling finish(), so use
+    // zio::Writer directly instead.
     #[cfg(feature = "zstd")]
-    Zstd(zstd::Encoder<'static, W>),
+    Zstd(zio::Writer<W, zraw::Encoder<'static>>),
     #[cfg(feature = "lz4")]
     Lz4(lz4::Encoder<W>),
 }
@@ -840,7 +1106,10 @@ impl<W: Write> Compressor<W> {
         Ok(match self {
             Compressor::Null(w) => w,
             #[cfg(feature = "zstd")]
-            Compressor::Zstd(w) => w.finish()?,
+            Compressor::Zstd(mut w) => {
+                w.finish()?;
+                w.into_inner().0
+            }
             #[cfg(feature = "lz4")]
             Compressor::Lz4(w) => {
                 let (output, result) = w.finish();
@@ -848,6 +1117,16 @@ impl<W: Write> Compressor<W> {
                 output
             }
         })
+    }
+
+    fn into_inner(self) -> W {
+        match self {
+            Compressor::Null(w) => w,
+            #[cfg(feature = "zstd")]
+            Compressor::Zstd(w) => w.into_inner().0,
+            #[cfg(feature = "lz4")]
+            Compressor::Lz4(w) => w.finish().0,
+        }
     }
 }
 
@@ -881,23 +1160,29 @@ struct ChunkWriter<W: Write> {
     /// Message start and end time, or None if there are no messages yet.
     message_bounds: Option<(u64, u64)>,
     compression_name: &'static str,
-    compressor: CountingCrcWriter<Compressor<ChunkSink<W>>>,
+    compressor: CountingCrcWriter<Compressor<CountingCrcWriter<ChunkSink<W>>>>,
     indexes: BTreeMap<u16, Vec<records::MessageIndexEntry>>,
+
+    // Hasher from data before the chunk.
+    pre_chunk_crc: crc32fast::Hasher,
+
+    emit_message_indexes: bool,
 }
 
 impl<W: Write + Seek> ChunkWriter<W> {
-    fn new(mut writer: W, compression: Option<Compression>, mode: ChunkMode) -> McapResult<Self> {
+    fn new(
+        mut writer: CountingCrcWriter<W>,
+        compression: Option<Compression>,
+        mode: ChunkMode,
+        emit_message_indexes: bool,
+    ) -> McapResult<Self> {
+        // Relative to start of original stream.
         let chunk_offset = writer.stream_position()?;
 
-        let mut sink = match mode {
-            ChunkMode::Buffered { mut buffer } => {
-                // ensure the buffer is empty before using it for the chunk
-                buffer.truncate(0);
-                ChunkSink::Buffered(writer, Cursor::new(buffer))
-            }
-            ChunkMode::Direct => ChunkSink::Direct(writer),
-        };
+        let (writer, pre_chunk_crc) = writer.finalize();
+        let mut sink = ChunkSink::new(writer, mode);
 
+        // Relative to start of chunk sink stream.
         let header_start = sink.stream_position()?;
 
         op_and_len(&mut sink, op::CHUNK, !0)?;
@@ -924,15 +1209,17 @@ impl<W: Write + Seek> ChunkWriter<W> {
         };
         sink.write_le(&header)?;
         let data_start = sink.stream_position()?;
+        let sink = CountingCrcWriter::new(sink);
 
         let compressor = match compression {
             #[cfg(feature = "zstd")]
             Some(Compression::Zstd) => {
                 #[allow(unused_mut)]
-                let mut enc = zstd::Encoder::new(sink, 0)?;
+                let mut enc = zraw::Encoder::with_dictionary(0, &[])?;
+                // Enable multithreaded encoding on non-WASM targets.
                 #[cfg(not(target_arch = "wasm32"))]
-                enc.multithread(num_cpus::get_physical() as u32)?;
-                Compressor::Zstd(enc)
+                enc.set_parameter(zraw::CParameter::NbWorkers(num_cpus::get_physical() as u32))?;
+                Compressor::Zstd(zio::Writer::new(sink, enc))
             }
             #[cfg(feature = "lz4")]
             Some(Compression::Lz4) => Compressor::Lz4(
@@ -952,42 +1239,33 @@ impl<W: Write + Seek> ChunkWriter<W> {
             chunk_offset,
             data_start,
             header_start,
-
             compressor,
             compression_name,
             message_bounds: None,
             indexes: BTreeMap::new(),
+            pre_chunk_crc,
+            emit_message_indexes,
         })
     }
 
-    fn write_schema(&mut self, id: u16, schema: &Schema) -> McapResult<()> {
+    fn write_schema(&mut self, schema: Schema) -> McapResult<()> {
         let header = records::SchemaHeader {
-            id,
-            name: schema.name.clone(),
-            encoding: schema.encoding.clone(),
+            id: schema.id,
+            name: schema.name,
+            encoding: schema.encoding,
         };
         write_record(
             &mut self.compressor,
             &Record::Schema {
                 header,
-                data: Cow::Borrowed(&schema.data),
+                data: schema.data,
             },
         )?;
         Ok(())
     }
 
-    fn write_channel(&mut self, id: u16, schema_id: u16, chan: &Channel) -> McapResult<()> {
-        assert_eq!(schema_id == 0, chan.schema.is_none());
-
-        let rec = records::Channel {
-            id,
-            schema_id,
-            topic: chan.topic.clone(),
-            message_encoding: chan.message_encoding.clone(),
-            metadata: chan.metadata.clone(),
-        };
-
-        write_record(&mut self.compressor, &Record::Channel(rec))?;
+    fn write_channel(&mut self, chan: records::Channel) -> McapResult<()> {
+        write_record(&mut self.compressor, &Record::Channel(chan))?;
         Ok(())
     }
 
@@ -998,14 +1276,16 @@ impl<W: Write + Seek> ChunkWriter<W> {
             Some((start, end)) => (start.min(header.log_time), end.max(header.log_time)),
         });
 
-        // Add an index for this message
-        self.indexes
-            .entry(header.channel_id)
-            .or_default()
-            .push(records::MessageIndexEntry {
-                log_time: header.log_time,
-                offset: self.compressor.position(),
-            });
+        if self.emit_message_indexes {
+            // Add an index for this message
+            self.indexes
+                .entry(header.channel_id)
+                .or_default()
+                .push(records::MessageIndexEntry {
+                    log_time: header.log_time,
+                    offset: self.compressor.position(),
+                });
+        }
 
         write_record(
             &mut self.compressor,
@@ -1017,52 +1297,59 @@ impl<W: Write + Seek> ChunkWriter<W> {
         Ok(())
     }
 
-    fn finish(self) -> McapResult<(W, ChunkMode, records::ChunkIndex)> {
+    fn finish(self) -> McapResult<(CountingCrcWriter<W>, ChunkMode, records::ChunkIndex)> {
         // Get the number of uncompressed bytes written and the CRC.
 
         let uncompressed_size = self.compressor.position();
-        let (stream, crc) = self.compressor.finalize();
-        let uncompressed_crc = crc;
+        let (stream, uncompressed_crc) = self.compressor.finalize();
 
         // Finalize the compression stream - it maintains an internal buffer.
-        let mut sink = stream.finish()?;
+        let writer = stream.finish()?;
+        let compressed_size = writer.position();
+        let (mut sink, compressed_crc) = writer.finalize();
+
         let data_end = sink.stream_position()?;
-        let compressed_size = data_end - self.data_start;
+        // let compressed_size =  data_end - self.data_start;
         let record_size = (data_end - self.header_start) - 9; // 1 byte op, 8 byte len
 
-        // Back up, write our finished header, then continue at the end of the stream.
+        // Now that we know the size of the chunk data and the CRC of the uncompressed data, we
+        // rewind the stream and overwrite the dummy chunk header with the true header.
         sink.seek(SeekFrom::Start(self.header_start))?;
-        op_and_len(&mut sink, op::CHUNK, record_size)?;
+        // Compute the CRC of the pre-chunk data concatenated with the chunk header.
+        let mut writer = CountingCrcWriter::with_hasher(sink, self.pre_chunk_crc);
+        op_and_len(&mut writer, op::CHUNK, record_size)?;
         let message_bounds = self.message_bounds.unwrap_or((0, 0));
         let header = records::ChunkHeader {
             message_start_time: message_bounds.0,
             message_end_time: message_bounds.1,
             uncompressed_size,
-            uncompressed_crc,
+            uncompressed_crc: uncompressed_crc.finalize(),
             compression: String::from(self.compression_name),
             compressed_size,
         };
-        sink.write_le(&header)?;
+        writer.write_le(&header)?;
+        let (mut sink, post_chunk_header_crc) = writer.finalize();
         assert_eq!(self.data_start, sink.stream_position()?);
+        // We're done with all the chunk data. Move the cursor past the end and go back to just
+        // appending records.
         assert_eq!(sink.seek(SeekFrom::End(0))?, data_end);
+        let chunk_length = data_end - self.header_start;
+        let (writer, mode) = sink.finish()?;
+
+        // Compute the CRC of the pre-chunk data + chunk header + compressed chunk data. That is,
+        // the CRC of the entire MCAP file up to the end of this chunk. This is necessary because
+        // we ultimately have to produce a correct CRC of the MCAP file until the DataEnd record.
+        let mut post_chunk_crc = post_chunk_header_crc;
+        post_chunk_crc.combine(&compressed_crc);
+        let mut writer = CountingCrcWriter::with_hasher(writer, post_chunk_crc);
 
         // Write our message indexes
+        let data_end = writer.stream_position()?;
         let mut message_index_offsets: BTreeMap<u16, u64> = BTreeMap::new();
-
         let mut index_buf = Vec::new();
         for (channel_id, records) in self.indexes {
-            // since the chunk sink position might be relative to a buffer, calculate the absolute
-            // position based on the `chunk_offset` and `header_start`.
-            //
-            // When the chunk is buffered and stream position is "relative" then `header_start`
-            // will be zero so the position will be relative to the chunk offset. When the stream
-            // position is "absolute" then `header_start` and `chunk_offset` will be equal and the
-            // position will be absolute.
-            let absolute_position =
-                (self.chunk_offset - self.header_start) + sink.stream_position()?;
-
-            let existing_offset = message_index_offsets.insert(channel_id, absolute_position);
-
+            let existing_offset =
+                message_index_offsets.insert(channel_id, writer.stream_position()?);
             assert!(existing_offset.is_none());
 
             index_buf.clear();
@@ -1070,32 +1357,22 @@ impl<W: Write + Seek> ChunkWriter<W> {
                 channel_id,
                 records,
             };
-
             Cursor::new(&mut index_buf).write_le(&index)?;
-            op_and_len(&mut sink, op::MESSAGE_INDEX, index_buf.len() as _)?;
-            sink.write_all(&index_buf)?;
+            op_and_len(&mut writer, op::MESSAGE_INDEX, index_buf.len() as _)?;
+            writer.write_all(&index_buf)?;
         }
-        let end_of_indexes = sink.stream_position()?;
+        let message_index_length = writer.stream_position()? - data_end;
 
         let index = records::ChunkIndex {
             message_start_time: header.message_start_time,
             message_end_time: header.message_end_time,
             chunk_start_offset: self.chunk_offset,
-            chunk_length: data_end - self.header_start,
+            chunk_length,
             message_index_offsets,
-            message_index_length: end_of_indexes - data_end,
+            message_index_length,
             compression: header.compression,
             compressed_size: header.compressed_size,
             uncompressed_size: header.uncompressed_size,
-        };
-
-        let (writer, mode) = match sink {
-            ChunkSink::Direct(w) => (w, ChunkMode::Direct),
-            ChunkSink::Buffered(mut w, data) => {
-                let buffer = data.into_inner();
-                w.write_all(&buffer)?;
-                (w, ChunkMode::Buffered { buffer })
-            }
         };
 
         Ok((writer, mode, index))
@@ -1179,7 +1456,7 @@ impl<W: Write + Seek> AttachmentWriter<W> {
         }
 
         let (mut writer, crc) = self.writer.finalize();
-        writer.write_u32::<LE>(crc)?;
+        writer.write_u32::<LE>(crc.finalize())?;
 
         let offset = self.record_offset;
         let length = writer.stream_position()? - offset;
@@ -1196,5 +1473,137 @@ impl<W: Write + Seek> AttachmentWriter<W> {
                 data_size: self.attachment_length,
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::u16;
+
+    use super::*;
+    #[test]
+    fn writes_all_channel_ids() {
+        let file = std::io::Cursor::new(Vec::new());
+        let mut writer = Writer::new(file).expect("failed to construct writer");
+        let custom_channel = std::sync::Arc::new(crate::Channel {
+            id: u16::MAX,
+            topic: "chat".into(),
+            message_encoding: "json".into(),
+            metadata: BTreeMap::new(),
+            schema: None,
+        });
+        writer
+            .write(&crate::Message {
+                channel: custom_channel.clone(),
+                sequence: 0,
+                log_time: 0,
+                publish_time: 0,
+                data: Cow::Owned(Vec::new()),
+            })
+            .expect("could not write initial channel");
+        for i in 1..65535u16 {
+            let id = writer
+                .add_channel(0, &format!("{i}"), "json", &BTreeMap::new())
+                .expect("could not add channel");
+            assert_eq!(i, id);
+        }
+        let Err(too_many) = writer.add_channel(0, "last", "json", &BTreeMap::new()) else {
+            panic!("should not be able to add another channel");
+        };
+        assert!(matches!(too_many, McapError::TooManyChannels));
+    }
+    #[test]
+    fn writes_all_schema_ids() {
+        let file = std::io::Cursor::new(Vec::new());
+        let mut writer = Writer::new(file).expect("failed to construct writer");
+        let custom_channel = std::sync::Arc::new(crate::Channel {
+            id: 0,
+            topic: "chat".into(),
+            message_encoding: "json".into(),
+            metadata: BTreeMap::new(),
+            schema: Some(std::sync::Arc::new(crate::Schema {
+                id: u16::MAX,
+                name: "int".into(),
+                encoding: "jsonschema".into(),
+                data: Cow::Owned(Vec::new()),
+            })),
+        });
+        writer
+            .write(&crate::Message {
+                channel: custom_channel.clone(),
+                sequence: 0,
+                log_time: 0,
+                publish_time: 0,
+                data: Cow::Owned(Vec::new()),
+            })
+            .expect("could not write initial channel");
+        for i in 0..65534u16 {
+            let id = writer
+                .add_schema(&format!("{i}"), "jsonschema", &[])
+                .expect("could not add schema");
+            assert_eq!(id, i + 1);
+        }
+        let Err(too_many) = writer.add_schema("last", "jsonschema", &[]) else {
+            panic!("should not be able to add another channel");
+        };
+        assert!(matches!(too_many, McapError::TooManySchemas));
+    }
+
+    #[test]
+    #[should_panic(expected = "Trying to write a record on a finished MCAP")]
+    fn panics_if_write_called_after_finish() {
+        let file = std::io::Cursor::new(Vec::new());
+        let mut writer = Writer::new(file).expect("failed to construct writer");
+        writer.finish().expect("failed to finish writer");
+
+        let custom_channel = std::sync::Arc::new(crate::Channel {
+            id: 1,
+            topic: "chat".into(),
+            message_encoding: "json".into(),
+            metadata: BTreeMap::new(),
+            schema: None,
+        });
+
+        writer
+            .write(&crate::Message {
+                channel: custom_channel.clone(),
+                sequence: 0,
+                log_time: 0,
+                publish_time: 0,
+                data: Cow::Owned(Vec::new()),
+            })
+            .expect("could not write message");
+    }
+
+    #[test]
+    fn writes_message_and_checks_stream_length() {
+        let file = std::io::Cursor::new(Vec::new());
+        let mut writer = Writer::new(file).expect("failed to construct writer");
+
+        let custom_channel = std::sync::Arc::new(crate::Channel {
+            id: 1,
+            topic: "chat".into(),
+            message_encoding: "json".into(),
+            metadata: BTreeMap::new(),
+            schema: None,
+        });
+
+        writer
+            .write(&crate::Message {
+                channel: custom_channel.clone(),
+                sequence: 0,
+                log_time: 0,
+                publish_time: 0,
+                data: Cow::Owned(Vec::new()),
+            })
+            .expect("could not write message");
+
+        writer.finish().expect("failed to finish writer");
+
+        let output_len = writer
+            .into_inner()
+            .stream_position()
+            .expect("failed to get stream position");
+        assert_eq!(output_len, 487);
     }
 }

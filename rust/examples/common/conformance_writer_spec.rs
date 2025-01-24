@@ -20,28 +20,29 @@ pub struct Record {
 }
 
 impl Record {
-    pub fn get_field(self: &Self, name: &str) -> &Value {
-        return &self
+    pub fn get_field(&self, name: &str) -> &Value {
+        &self
             .fields
             .iter()
             .find(|f| f.0 == name)
             .unwrap_or_else(|| panic!("Invalid: {}", name))
-            .1;
+            .1
     }
 
-    pub fn get_field_data(self: &Self, name: &str) -> Vec<u8> {
-        let data: Vec<u8> = self
-            .get_field(name)
+    pub fn get_field_data(&self, name: &str) -> Vec<u8> {
+        self.get_field(name)
             .as_array()
             .unwrap_or_else(|| panic!("Invalid: {}", name))
-            .into_iter()
-            .filter_map(|v| v.as_u64())
-            .filter_map(|n| u8::try_from(n).ok())
-            .collect();
-        return data;
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => s.parse::<u8>().ok(),
+                Value::Number(n) => n.as_u64()?.try_into().ok(),
+                _ => None,
+            })
+            .collect()
     }
 
-    pub fn get_field_meta(self: &Self, name: &str) -> BTreeMap<String, String> {
+    pub fn get_field_meta(&self, name: &str) -> BTreeMap<String, String> {
         let data = self
             .get_field(name)
             .as_object()
@@ -50,38 +51,34 @@ impl Record {
         for (key, value) in data.iter() {
             result.insert(key.to_string(), value.as_str().unwrap().to_string());
         }
-        return result;
+        result
     }
 
-    pub fn get_field_str(self: &Self, name: &str) -> &str {
-        return self
-            .get_field(name)
+    pub fn get_field_str(&self, name: &str) -> &str {
+        self.get_field(name)
             .as_str()
-            .unwrap_or_else(|| panic!("Invalid: {}", name));
+            .unwrap_or_else(|| panic!("Invalid: {}", name))
     }
 
-    pub fn get_field_u16(self: &Self, name: &str) -> u16 {
-        return self
-            .get_field(name)
+    pub fn get_field_u16(&self, name: &str) -> u16 {
+        self.get_field(name)
             .as_str()
             .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or_else(|| panic!("Invalid: {}", name));
+            .unwrap_or_else(|| panic!("Invalid: {}", name))
     }
 
-    pub fn get_field_u32(self: &Self, name: &str) -> u32 {
-        return self
-            .get_field(name)
+    pub fn get_field_u32(&self, name: &str) -> u32 {
+        self.get_field(name)
             .as_str()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or_else(|| panic!("Invalid: {}", name));
+            .unwrap_or_else(|| panic!("Invalid: {}", name))
     }
 
-    pub fn get_field_u64(self: &Self, name: &str) -> u64 {
-        return self
-            .get_field(name)
+    pub fn get_field_u64(&self, name: &str) -> u64 {
+        self.get_field(name)
             .as_str()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| panic!("Invalid: {}", name));
+            .unwrap_or_else(|| panic!("Invalid: {}", name))
     }
 }
 
